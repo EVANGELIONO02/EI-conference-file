@@ -225,6 +225,14 @@ def run(config_path: Path, quick=False):
             try:
                 net, device, info = train_one(arrays, indexes, cfg, work, method, seed); a, b, c = evaluate(net, device, arrays, indexes, cfg, scales, method, seed); overall += a; grouped += b; scenarios_rows += c; models[(method, seed)] = (net, device); log["runs"].append({"method": method, "seed": seed, "status": "completed", **info}); print(f"Completed {method}, seed={seed}", flush=True)
             except Exception as e: log["runs"].append({"method": method, "seed": seed, "status": "failed", "error": repr(e), "traceback": traceback.format_exc()})
+    # Interpolation is deterministic and has no checkpoint or training seed.
+    print("\nEvaluating linear interpolation baseline", flush=True)
+    try:
+        a, b, c = evaluate(None, torch.device("cpu"), arrays, indexes, cfg, scales, "linear_interpolation", "deterministic")
+        overall += a; grouped += b; scenarios_rows += c
+        log["runs"].append({"method": "linear_interpolation", "seed": "deterministic", "status": "completed"})
+    except Exception as e:
+        log["runs"].append({"method": "linear_interpolation", "seed": "deterministic", "status": "failed", "error": repr(e), "traceback": traceback.format_exc()})
     # The no-weather model is the sole ablation and reuses its already evaluated rows.
     ablation = [{"variant_id": "remove_weather", "removed_component": "weather_condition", **r} for r in overall if r["method_id"] == "diffusion_no_weather"]
     support_models = {k: v for k, v in models.items() if k[1] == cfg["train_seeds"][0]}
