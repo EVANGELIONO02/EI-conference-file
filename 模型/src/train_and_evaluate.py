@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 import csv, json, math, random, time, traceback
 from pathlib import Path
 import numpy as np, torch
@@ -9,31 +9,28 @@ from data_pipeline import POWER, build_dataset
 from diffusion_model import ConditionalDiffusion
 
 REGIMES = ["low_wind", "medium_wind", "high_wind"]
-METHODS = ["diffusion_no_weather", "proposed_weather_diffusion"]
+TRAIN_METHODS = ["gan_imputer", "diffusion_no_weather", "proposed_weather_diffusion"]
+EVAL_METHODS = ["linear_interpolation", *TRAIN_METHODS]
+MASK_TYPES = ["random_point", "random_continuous"]
 
 def seed_all(seed):
     """Fix Python, NumPy, and PyTorch randomness for reproducible seeds."""
     random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
 
-def mask_window(L, rate, block, rng):
-    """Create a four-channel mixed mask: one block plus random points."""
-    m = int(math.floor(L * rate + .5)); out = np.ones((L, 4), dtype=np.float32)
-    if block >= m: return None
+def mask_window(L, mask_type, value, rng):
+    """Create an independent four-channel random-point or continuous mask."""
+    out = np.ones((L, 4), dtype=np.float32)
+    m = max(1, int(math.floor(L * value + .5))) if mask_type == "random_point" else int(value)
     for ch in range(4):
-        start = int(rng.integers(0, L - block + 1)); out[start:start + block, ch] = 0
-        candidates = np.flatnonzero(out[:, ch]); candidates = candidates[(candidates < start - 1) | (candidates > start + block)]
-        if m - block > len(candidates): return None
-        out[rng.choice(candidates, m - block, replace=False), ch] = 0
+        if mask_type == "random_point":
+            out[rng.choice(L, m, replace=False), ch] = 0
+        else:
+            start = int(rng.integers(0, L - m + 1)); out[start:start + m, ch] = 0
     return out
 
 def scenarios(cfg):
-    """Return all feasible (missing_rate, block_length) scenarios."""
-    result = []
-    for rate in cfg["missing_rates"]:
-        m = int(math.floor(cfg["window_length"] * rate + .5))
-        for block in cfg["block_lengths"]:
-            if block < m: result.append((rate, block))
-    return result
+    """Return the fixed point and continuous-mask test scenarios."""
+    return [("random_point", rate) for rate in cfg["point_missing_rates"]] + [("random_continuous", length) for length in cfg["continuous_lengths"] if length <= cfg["window_length"]]
 
 class Windows(Dataset):
     """Expose continuous arrays as PyTorch windows."""
@@ -45,8 +42,35 @@ class Windows(Dataset):
 
 def model(cfg, weather): return ConditionalDiffusion(cfg["model_dim"], cfg["transformer_layers"], cfg["attention_heads"], cfg["diffusion_train_steps"], weather, cfg["window_length"])
 
+class GANImputer(nn.Module):
+    """Conditional GAN baseline: generator fills missing values and discriminator scores realism."""
+    def __init__(self, hidden=128):
+        super().__init__()
+        self.generator = nn.Sequential(nn.Linear(21, hidden), nn.GELU(), nn.Linear(hidden, hidden), nn.GELU(), nn.Linear(hidden, 4))
+        self.discriminator = nn.Sequential(nn.Linear(21, hidden), nn.GELU(), nn.Linear(hidden, 1))
+
+    def generate(self, observed, mask, weather):
+        generated = self.generator(torch.cat([observed, mask, weather], -1))
+        return torch.where(mask.bool(), observed, generated)
+
+def train_gan(arrays, indexes, cfg, work, seed):
+    """Train the GAN imputer using reconstruction loss on missing positions."""
+    seed_all(seed); device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    loader = DataLoader(Windows(arrays["train"], indexes["train"], cfg["window_length"]), cfg["batch_size"], shuffle=True, num_workers=cfg["num_workers"])
+    net = GANImputer(cfg["model_dim"]).to(device); opt_g = torch.optim.AdamW(net.generator.parameters(), lr=cfg["learning_rate"]); opt_d = torch.optim.AdamW(net.discriminator.parameters(), lr=cfg["learning_rate"]); rng = np.random.default_rng(seed + 7000); logs = []
+    for epoch in tqdm(range(1, cfg["train_max_epochs"] + 1), desc=f"train gan_imputer seed={seed}", unit="epoch"):
+        total = 0.0
+        for p, w, _ in tqdm(loader, desc=f"gan epoch {epoch}", leave=False, unit="batch"):
+            p, w = p.to(device), w.to(device); pairs = [scenarios(cfg)[int(rng.integers(len(scenarios(cfg))))] for _ in range(len(p))]; mask = torch.from_numpy(np.stack([mask_window(cfg["window_length"], a, b, rng) for a, b in pairs])).to(device); obs = p * mask
+            fake = net.generate(obs, mask, w); real_score = net.discriminator(torch.cat([p, mask, w], -1)); fake_score = net.discriminator(torch.cat([fake.detach(), mask, w], -1)); d_loss = nn.functional.binary_cross_entropy_with_logits(real_score, torch.ones_like(real_score)) + nn.functional.binary_cross_entropy_with_logits(fake_score, torch.zeros_like(fake_score)); opt_d.zero_grad(); d_loss.backward(); opt_d.step()
+            fake = net.generate(obs, mask, w); score = net.discriminator(torch.cat([fake, mask, w], -1)); miss = 1 - mask; rec = ((fake - p).abs() * miss).sum() / miss.sum().clamp_min(1); g_loss = rec + 0.01 * nn.functional.binary_cross_entropy_with_logits(score, torch.ones_like(score)); opt_g.zero_grad(); g_loss.backward(); opt_g.step(); total += float(g_loss.detach())
+        logs.append({"epoch": epoch, "train_loss": total / max(len(loader), 1)}); tqdm.write(f"gan_imputer seed={seed} epoch={epoch}: loss={logs[-1]['train_loss']:.6f}")
+    path = work / "checkpoints" / f"gan_imputer_seed{seed}.pt"; path.parent.mkdir(parents=True, exist_ok=True); torch.save({"state_dict": net.state_dict(), "method": "gan_imputer", "seed": seed}, path); write_csv(work / "logs" / f"train_gan_imputer_seed{seed}.csv", logs); return net, device, {"epochs_run": len(logs), "checkpoint": str(path)}
+
 def train_one(arrays, indexes, cfg, work, method, seed):
     """Train one diffusion method and save its best validation checkpoint."""
+    if method == "gan_imputer":
+        return train_gan(arrays, indexes, cfg, work, seed)
     seed_all(seed); device = torch.device("cuda" if torch.cuda.is_available() else "cpu"); weather = method != "diffusion_no_weather"
     train = DataLoader(Windows(arrays["train"], indexes["train"], cfg["window_length"]), cfg["batch_size"], shuffle=True, num_workers=cfg["num_workers"])
     val = DataLoader(Windows(arrays["val"], indexes["val"], cfg["window_length"]), cfg["batch_size"], shuffle=False, num_workers=cfg["num_workers"])
@@ -58,7 +82,7 @@ def train_one(arrays, indexes, cfg, work, method, seed):
         for p, w, c in batches:
             p, w, c = p.to(device), w.to(device), c.to(device); masks = []
             for _ in range(len(p)):
-                rate, block = scenarios(cfg)[int(rng.integers(len(scenarios(cfg))))]; masks.append(mask_window(cfg["window_length"], rate, block, rng))
+                mask_type, value = scenarios(cfg)[int(rng.integers(len(scenarios(cfg))))]; masks.append(mask_window(cfg["window_length"], mask_type, value, rng))
             mask = torch.from_numpy(np.stack(masks)).to(device); obs = p * mask; loss = (net.loss_per_sample(p, obs, mask, w if weather else None) * weights[c]).mean(); opt.zero_grad(); loss.backward(); torch.nn.utils.clip_grad_norm_(net.parameters(), 1); opt.step(); total += float(loss.detach())
         val_score = validate(net, val, cfg, device, weather, seed + epoch); logs.append({"epoch": epoch, "train_loss": total / max(len(train), 1), "val_rmse": val_score})
         tqdm.write(f"{method} seed={seed} epoch={epoch}: val_rmse={val_score:.6f}")
@@ -73,7 +97,11 @@ def validate(net, loader, cfg, device, weather, seed):
     """Evaluate normalized missing-position RMSE for early stopping."""
     rng = np.random.default_rng(seed); sq = n = 0
     for p, w, _ in tqdm(loader, desc="validation", leave=False, unit="batch"):
-        p, w = p.to(device), w.to(device); pairs = [scenarios(cfg)[int(rng.integers(len(scenarios(cfg))))] for _ in range(len(p))]; masks = torch.from_numpy(np.stack([mask_window(cfg["window_length"], a, b, rng) for a, b in pairs])).to(device); pred = net.sample(p * masks, masks, w if weather else None, cfg["validation_ddim_steps"], 1); sq += float((((pred - p) ** 2) * (1 - masks)).sum()); n += int((1 - masks).sum())
+        p, w = p.to(device), w.to(device)
+        pairs = [scenarios(cfg)[int(rng.integers(len(scenarios(cfg))))] for _ in range(len(p))]
+        masks = torch.from_numpy(np.stack([mask_window(cfg["window_length"], a, b, rng) for a, b in pairs])).to(device)
+        pred = net.sample(p * masks, masks, w if weather else None, cfg["validation_ddim_steps"], 1)
+        sq += float((((pred - p) ** 2) * (1 - masks)).sum()); n += int((1 - masks).sum())
     return math.sqrt(sq / max(n, 1))
 
 def inverse(x, scale): return np.asarray(x) * (scale["max"] - scale["min"] or 1) + scale["min"]
@@ -85,29 +113,65 @@ def metrics(y, p, scale):
     mean_error = float(np.mean(abs_error))
     return {"abs_error_max": float(np.max(abs_error)), "abs_error_min": float(np.min(abs_error)), "MAE": mean_error, "n_points": int(len(y))}
 
+def linear_fill(observed, mask):
+    """Fill each channel by linear interpolation, using an edge value at boundaries."""
+    out = np.asarray(observed, dtype=np.float32).copy(); L, C = out.shape
+    for ch in range(C):
+        known = np.flatnonzero(mask[:, ch] > 0)
+        if not len(known):
+            continue
+        missing = np.flatnonzero(mask[:, ch] <= 0)
+        out[missing, ch] = np.interp(missing, known, out[known, ch])
+    return out
+
+@torch.no_grad()
+def reconstruct_batch(method, net, device, power, weather, masks, cfg):
+    """Apply one reconstruction method while preserving every observed value."""
+    if method == "linear_interpolation":
+        return np.stack([linear_fill(power[i] * masks[i], masks[i]) for i in range(len(power))])
+    pt = torch.as_tensor(power * masks, device=device, dtype=torch.float32)
+    mt = torch.as_tensor(masks, device=device, dtype=torch.float32)
+    wt = torch.as_tensor(weather, device=device, dtype=torch.float32)
+    if method == "gan_imputer":
+        pred = net.generate(pt, mt, wt)
+    else:
+        pred = net.sample(pt, mt, wt if method != "diffusion_no_weather" else None, cfg["ddim_steps"], cfg["ddim_samples"])
+    return pred.detach().cpu().numpy()
+
 def evaluate(net, device, arrays, indexes, cfg, scales, method, seed):
-    """Evaluate overall and weather-regime reconstruction with fixed masks."""
-    rng = np.random.default_rng(cfg["mask_seed"]); starts = indexes["test"]; L = cfg["window_length"]; all_rows = []; grouped_bins = {}; pooled = {x: [] for x in POWER}; scenarios_data = scenarios(cfg)
-    for rate, block in tqdm(scenarios_data, desc=f"evaluate {method} seed={seed}", unit="scenario"):
-        vals = {x: {"y": [], "p": [], "obs": [], "clusters": []} for x in POWER}
-        offsets = range(0, len(starts), min(cfg["batch_size"], 256))
-        for offset in tqdm(offsets, desc=f"mask {rate:.2f}/{block}h", leave=False, unit="batch"):
-            ss = starts[offset:offset + min(cfg["batch_size"], 256)]; p = np.stack([arrays["test"]["power"][s:s + L] for s in ss]); w = np.stack([arrays["test"]["weather"][s:s + L] for s in ss]); masks = np.stack([mask_window(L, rate, block, rng) for _ in ss]); pt = torch.tensor(p, device=device); wt = torch.tensor(w, device=device); mt = torch.tensor(masks, device=device); pred = net.sample(pt * mt, mt, wt, cfg["ddim_steps"], cfg["ddim_samples"]).cpu().numpy();
+    """Evaluate one method for every mask scenario and weather regime."""
+    rng = np.random.default_rng(cfg["mask_seed"] + seed); starts = indexes["test"]; L = cfg["window_length"]; all_rows = []; grouped = []
+    for mask_type, value in tqdm(scenarios(cfg), desc=f"evaluate {method} seed={seed}", unit="scenario"):
+        vals = {x: {"y": [], "p": [], "clusters": [], "windows": set()} for x in POWER}
+        regime = {(field, c): {"y": [], "p": [], "windows": set()} for field in POWER for c in range(3)}
+        batch_size = min(cfg["batch_size"], 256)
+        for offset in tqdm(range(0, len(starts), batch_size), desc=f"mask {mask_type}:{value}", leave=False, unit="batch"):
+            ss = starts[offset:offset + batch_size]
+            p = np.stack([arrays["test"]["power"][s:s + L] for s in ss])
+            w = np.stack([arrays["test"]["weather"][s:s + L] for s in ss])
+            masks = np.stack([mask_window(L, mask_type, value, rng) for _ in ss])
+            pred = reconstruct_batch(method, net, device, p, w, masks, cfg)
+            pred = np.where(masks > 0, p, pred)
             for j, s in enumerate(ss):
                 for ch, field in enumerate(POWER):
-                    miss = masks[j, :, ch] == 0; obs = ~miss; y = inverse(p[j, miss, ch], scales["power"][field]); q = inverse(pred[j, miss, ch], scales["power"][field]); point_clusters = arrays["test"]["cluster"][s + np.flatnonzero(miss)]; vals[field]["y"].extend(y); vals[field]["p"].extend(q); vals[field]["obs"].append(float(np.max(np.abs(pred[j, obs, ch] - p[j, obs, ch]))) if obs.any() else 0); vals[field]["clusters"].extend(point_clusters.tolist()); pooled[field].append((y, q))
-                    for cluster in np.unique(point_clusters):
-                        take = point_clusters == cluster; key = (field, int(cluster)); bucket = grouped_bins.setdefault(key, {"y": [], "p": [], "windows": set()}); bucket["y"].extend(y[take]); bucket["p"].extend(q[take]); bucket["windows"].add(int(s))
+                    miss = masks[j, :, ch] == 0
+                    if not miss.any(): continue
+                    y = inverse(p[j, miss, ch], scales["power"][field]); q = inverse(pred[j, miss, ch], scales["power"][field])
+                    clusters = arrays["test"]["cluster"][s + np.flatnonzero(miss)]
+                    vals[field]["y"].extend(y.tolist()); vals[field]["p"].extend(q.tolist()); vals[field]["windows"].add(int(s))
+                    for c in np.unique(clusters):
+                        take = clusters == c; bucket = regime[(field, int(c))]; bucket["y"].extend(y[take].tolist()); bucket["p"].extend(q[take].tolist()); bucket["windows"].add(int(s))
         for field in POWER:
-            scale = scales["power"][field]; v = vals[field]; mm = metrics(v["y"], v["p"], scale); all_rows.append({"method_id": method, "target_field": field, "mask_mode": "mixed", "missing_rate": rate, "block_length": block, "train_seed": seed, "row_type": "run", "n_windows": len(starts), "n_missing_points": mm.pop("n_points"), **mm, "observed_max_abs_error": max(v["obs"], default=0)})
-    grouped = []
-    for (field, cluster), bucket in grouped_bins.items():
-        mm = metrics(bucket["y"], bucket["p"], scales["power"][field]); grouped.append({"method_id": method, "target_field": field, "weather_cluster": cluster, "weather_regime": REGIMES[cluster], "mask_mode": "mixed", "train_seed": seed, "row_type": "run", "n_windows": len(bucket["windows"]), "n_missing_points": mm.pop("n_points"), **mm})
-    overall = []
-    for field in POWER:
-        y = np.concatenate([x[0] for x in pooled[field]]); p = np.concatenate([x[1] for x in pooled[field]]); mm = metrics(y, p, scales["power"][field]); overall.append({"method_id": method, "target_field": field, "train_seed": seed, "row_type": "run", "n_windows": len(starts), "n_missing_points": mm.pop("n_points"), **mm, "observed_max_abs_error": 0})
-    return overall, grouped, all_rows
-
+            mm = metrics(vals[field]["y"], vals[field]["p"], scales["power"][field]); row = {"method_id": method, "target_field": field, "mask_type": mask_type, "train_seed": seed, "n_windows": len(vals[field]["windows"]), "n_missing_points": mm.pop("n_points"), **mm}
+            if mask_type == "random_point": row["missing_rate"] = value
+            else: row["missing_length"] = value
+            all_rows.append(row)
+            for c in range(3):
+                b = regime[(field, c)]; gm = metrics(b["y"], b["p"], scales["power"][field]); grow = {"method_id": method, "target_field": field, "mask_type": mask_type, "weather_regime": REGIMES[c], "train_seed": seed, "n_windows": len(b["windows"]), "n_missing_points": gm.pop("n_points"), **gm}
+                if mask_type == "random_point": grow["missing_rate"] = value
+                else: grow["missing_length"] = value
+                grouped.append(grow)
+    return all_rows, grouped, all_rows
 def write_csv(path, rows):
     """Write result rows using the union of their CSV fields."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -125,48 +189,36 @@ class ForecastNet(nn.Module):
     def forward(self, x): return self.net(x)
 
 def forecast_support(arrays, indexes, cfg, scales, models):
-    """Compare complete, masked, and reconstructed histories for four targets."""
-    rows = []; L = cfg["window_length"]; rng = np.random.default_rng(cfg["mask_seed"] + 700)
+    """Compare complete, masked, and reconstructed histories per mask condition."""
+    rows = []; L = cfg["window_length"]; rng = np.random.default_rng(cfg["mask_seed"] + 700); device = next(iter(models.values()))[1] if models else torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for target in tqdm(POWER, desc="forecast support", unit="target"):
         ci = POWER.index(target)
         def select(split):
-            data = arrays[split]; hs = []; ws = []; ys = []
+            data = arrays[split]; hs=[]; ws=[]; ys=[]
             for s in indexes[split]:
-                s = int(s); h = data["power"][s:s + L].copy(); h[-1, ci] = 0; hs.append(h); ws.append(data["weather"][s + L - 1]); ys.append(data["power"][s + L - 1, ci])
-            return np.asarray(hs, dtype=np.float32), np.asarray(ws, dtype=np.float32), np.asarray(ys, dtype=np.float32)
-        th, tw, ty = select("train"); vh, vw, vy = select("val"); eh, ew, ey = select("test")
-        X = np.concatenate([th.reshape(len(th), -1), tw], 1); VX = np.concatenate([vh.reshape(len(vh), -1), vw], 1); EX = np.concatenate([eh.reshape(len(eh), -1), ew], 1)
-        mu, sd = ty.mean(), ty.std() or 1; net = ForecastNet(X.shape[1], cfg["forecast_hidden_dim"]).to(next(iter(models.values()))[1] if models else torch.device("cuda" if torch.cuda.is_available() else "cpu")); device = next(net.parameters()).device; opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
-        tx, vx, yy, vy_t = [torch.tensor(z, device=device, dtype=torch.float32) for z in (X, VX, (ty - mu) / sd, (vy - mu) / sd)]
-        for _ in range(cfg["forecast_epochs"]):
-            opt.zero_grad(); loss = nn.functional.mse_loss(net(tx), yy[:, None]); loss.backward(); opt.step()
-        histories = {"complete": eh.copy(), "masked": [], "linear_interpolation": []}
-        preds = {key: [] for key in ["complete", "masked", "linear_interpolation", *METHODS]}
-        for h in eh:
-            mask = mask_window(L, .3, 3, rng); masked = h.copy(); masked[mask == 0] = .5; masked[-1, ci] = 0; linear = masked.copy()
-            for ch in range(4):
-                known = np.flatnonzero(mask[:, ch]);
-                for pos in np.flatnonzero(mask[:, ch] == 0): linear[pos, ch] = h[known[-1], ch] if pos > known[-1] else h[known[0], ch]
-            histories["masked"].append(masked); histories["linear_interpolation"].append(linear)
-        for key, hs in histories.items():
-            if len(hs) != len(ey): raise RuntimeError(f"forecast history length mismatch: {key}={len(hs)} test={len(ey)}")
-            fx = torch.tensor(np.concatenate([np.asarray(hs).reshape(len(hs), -1), ew], 1), device=device, dtype=torch.float32)
-            preds[key] = (net(fx).detach().cpu().numpy().ravel() * sd + mu)
-        for (method, _seed), pair in models.items():
-            net_diff, d = pair; batch = torch.tensor(eh, device=d); weather = torch.tensor(np.repeat(ew[:, None, :], L, 1), device=d); masks = torch.ones_like(batch); masks[:, -1, ci] = 0; out = net_diff.sample(batch * masks, masks, weather if method != "diffusion_no_weather" else None, cfg["ddim_steps"], cfg["ddim_samples"]); fx = torch.tensor(np.concatenate([out.cpu().numpy().reshape(len(eh), -1), ew], 1), device=device, dtype=torch.float32); preds[method] = (net(fx).detach().cpu().numpy().ravel() * sd + mu)
-        y = inverse(ey, scales["power"][target])
-        for key, values in preds.items():
-            mm = metrics(y, inverse(values, scales["power"][target]), scales["power"][target]); rows.append({"target_field": target, "history_setting": "complete" if key == "complete" else ("masked" if key == "masked" else "reconstructed"), "reconstruction_method": key if key not in {"complete", "masked"} else "none", "n_windows": len(y), **mm, "status": "completed"})
+                s=int(s); hs.append(data["power"][s:s+L].copy()); ws.append(data["weather"][s+L-1]); ys.append(data["power"][s+L-1,ci])
+            return np.asarray(hs,np.float32), np.asarray(ws,np.float32), np.asarray(ys,np.float32)
+        th,tw,ty=select("train"); vh,vw,vy=select("val"); eh,ew,ey=select("test")
+        X=np.concatenate([th.reshape(len(th),-1),tw],1); VX=np.concatenate([vh.reshape(len(vh),-1),vw],1); mu,sd=ty.mean(),ty.std() or 1
+        predictor=ForecastNet(X.shape[1],cfg["forecast_hidden_dim"]).to(device); opt=torch.optim.AdamW(predictor.parameters(),lr=1e-3,weight_decay=1e-4)
+        tx=torch.tensor(X,device=device); yy=torch.tensor((ty-mu)/sd,device=device,dtype=torch.float32)[:,None]
+        for _ in range(cfg["forecast_epochs"]): opt.zero_grad(); loss=nn.functional.mse_loss(predictor(tx),yy); loss.backward(); opt.step()
+        for mask_type,value in scenarios(cfg):
+            masks=np.stack([mask_window(L,mask_type,value,rng) for _ in eh]); masked=eh*masks; linear=np.stack([linear_fill(masked[i],masks[i]) for i in range(len(eh))])
+            variants={"complete":eh,"masked":masked,"linear_interpolation":linear}
+            for (method,seed),(net,d) in models.items():
+                w=torch.tensor(np.repeat(ew[:,None,:],L,1),device=d); out=reconstruct_batch(method,net,d,eh, np.repeat(ew[:,None,:],L,1), masks, cfg); variants[f"{method}_{seed}"]=out
+            for setting,hist in variants.items():
+                fx=torch.tensor(np.concatenate([hist.reshape(len(hist),-1),ew],1),device=device,dtype=torch.float32); pred=predictor(fx).detach().cpu().numpy().ravel()*sd+mu; mm=metrics(inverse(ey,scales["power"][target]),inverse(pred,scales["power"][target]),scales["power"][target]); row={"target_field":target,"mask_type":mask_type,"history_setting":"complete" if setting=="complete" else ("masked" if setting=="masked" else "reconstructed"),"reconstruction_method":"none" if setting in {"complete","masked"} else setting,"n_windows":len(ey),**mm,"status":"completed"}; row["missing_rate" if mask_type=="random_point" else "missing_length"]=value; rows.append(row)
     return rows
-
 def run(config_path: Path, quick=False):
     """Run data preparation, six training jobs, evaluation, and CSV export."""
     root = config_path.parent; cfg = json.loads(config_path.read_text(encoding="utf-8"));
     if quick: cfg.update({"train_max_epochs": 1, "early_stopping_patience": 1, "batch_size": 16, "ddim_steps": 3, "ddim_samples": 1, "forecast_epochs": 1})
     work, results = root / "work_v2", (root / "results_v2" / "quick" if quick else root / "results"); data = (root / cfg["data_path"]).resolve(); arrays, indexes, scales, audit = build_dataset(data, work, cfg); log = {"device": torch.cuda.get_device_name(0) if torch.cuda.is_available() else "cpu", "audit": audit, "runs": []}; overall, grouped, scenarios_rows = [], [], []; models = {}
-    total_runs = len(METHODS) * len(cfg["train_seeds"])
+    total_runs = len(TRAIN_METHODS) * len(cfg["train_seeds"])
     run_number = 0
-    for method in METHODS:
+    for method in TRAIN_METHODS:
         for seed in cfg["train_seeds"]:
             run_number += 1
             print(f"\n[{run_number}/{total_runs}] Starting {method}, seed={seed}", flush=True)
@@ -179,3 +231,6 @@ def run(config_path: Path, quick=False):
     print("\nStarting forecast-support evaluation", flush=True)
     support = forecast_support(arrays, indexes, cfg, scales, support_models)
     write_csv(results / "reconstruction_comparison.csv", overall); write_csv(results / "reconstruction_grouped_comparison.csv", grouped); write_csv(results / "forecast_support_comparison.csv", support); write_csv(results / "ablation_comparison.csv", ablation); (work / "logs").mkdir(parents=True, exist_ok=True); (work / "logs" / "run_summary.json").write_text(json.dumps(log, ensure_ascii=False, indent=2), encoding="utf-8"); print(f"\nExported four result CSV files to: {results}", flush=True); return log
+
+
+
