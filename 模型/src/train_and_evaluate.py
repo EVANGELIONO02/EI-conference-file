@@ -140,7 +140,7 @@ def reconstruct_batch(method, net, device, power, weather, masks, cfg):
 
 def evaluate(net, device, arrays, indexes, cfg, scales, method, seed):
     """Evaluate one method for every mask scenario and weather regime."""
-    rng = np.random.default_rng(cfg["mask_seed"] + seed); starts = indexes["test"]; L = cfg["window_length"]; all_rows = []; grouped = []
+    rng = np.random.default_rng(cfg["mask_seed"] + (int(seed) if isinstance(seed, (int, np.integer)) else 0)); starts = indexes["test"]; L = cfg["window_length"]; all_rows = []; grouped = []
     for mask_type, value in tqdm(scenarios(cfg), desc=f"evaluate {method} seed={seed}", unit="scenario"):
         vals = {x: {"y": [], "p": [], "clusters": [], "windows": set()} for x in POWER}
         regime = {(field, c): {"y": [], "p": [], "windows": set()} for field in POWER for c in range(3)}
