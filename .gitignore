@@ -1,0 +1,11 @@
+模型/work/
+模型/work_v2/
+模型/src/__pycache__/
+模型/**/*.py[cod]
+模型/**/*.pt
+模型/**/*.pth
+模型/**/*.ckpt
+模型/**/*.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

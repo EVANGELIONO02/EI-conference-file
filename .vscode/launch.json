@@ -1,0 +1,15 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "风电扩散模型正式训练",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/模型/src/run_experiment.py",
+            "cwd": "${workspaceFolder}/模型",
+            "args": ["--config", "config.json"],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        }
+    ]
+}

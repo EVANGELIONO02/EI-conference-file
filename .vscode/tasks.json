@@ -1,0 +1,20 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "正式训练并导出结果",
+            "type": "process",
+            "command": "python",
+            "args": ["src/run_experiment.py", "--config", "config.json"],
+            "options": {
+                "cwd": "${workspaceFolder}/模型"
+            },
+            "presentation": {
+                "reveal": "always",
+                "panel": "shared",
+                "showReuseMessage": false
+            },
+            "problemMatcher": []
+        }
+    ]
+}
