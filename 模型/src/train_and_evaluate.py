@@ -12,6 +12,7 @@ REGIMES = ["low_wind", "medium_wind", "high_wind"]
 TRAIN_METHODS = ["gan_imputer", "diffusion_no_weather", "proposed_weather_diffusion"]
 EVAL_METHODS = ["linear_interpolation", *TRAIN_METHODS]
 MASK_TYPES = ["random_point", "random_continuous"]
+GROUPED_METHODS = {"diffusion_no_weather", "proposed_weather_diffusion"}
 
 def seed_all(seed):
     """Fix Python, NumPy, and PyTorch randomness for reproducible seeds."""
@@ -166,11 +167,14 @@ def evaluate(net, device, arrays, indexes, cfg, scales, method, seed):
             if mask_type == "random_point": row["missing_rate"] = value
             else: row["missing_length"] = value
             all_rows.append(row)
-            for c in range(3):
-                b = regime[(field, c)]; gm = metrics(b["y"], b["p"], scales["power"][field]); grow = {"method_id": method, "target_field": field, "mask_type": mask_type, "weather_regime": REGIMES[c], "train_seed": seed, "n_windows": len(b["windows"]), "n_missing_points": gm.pop("n_points"), **gm}
-                if mask_type == "random_point": grow["missing_rate"] = value
-                else: grow["missing_length"] = value
-                grouped.append(grow)
+            # Weather-regime breakdown is reserved for the two diffusion models.
+            # GAN and interpolation have no weather-condition ablation branch.
+            if method in GROUPED_METHODS:
+                for c in range(3):
+                    b = regime[(field, c)]; gm = metrics(b["y"], b["p"], scales["power"][field]); grow = {"method_id": method, "target_field": field, "mask_type": mask_type, "weather_regime": REGIMES[c], "train_seed": seed, "n_windows": len(b["windows"]), "n_missing_points": gm.pop("n_points"), **gm}
+                    if mask_type == "random_point": grow["missing_rate"] = value
+                    else: grow["missing_length"] = value
+                    grouped.append(grow)
     return all_rows, grouped, all_rows
 def write_csv(path, rows):
     """Write result rows using the union of their CSV fields."""

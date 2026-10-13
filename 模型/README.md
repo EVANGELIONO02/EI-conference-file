@@ -34,7 +34,7 @@ conda run -n diffusion312 python src/run_experiment.py --config config.json
 
 ### `reconstruction_grouped_comparison.csv`
 
-按气象工况分组的重构结果。除上述字段外，`weather_regime` 表示低风、中风或高风工况。该表用于判断模型在不同气象条件下的稳定性，掩码类别仍由 `mask_type` 区分。
+仅对两种扩散模型按气象工况分组：`diffusion_no_weather` 与 `proposed_weather_diffusion`。除上述字段外，`weather_regime` 表示低风、中风或高风工况。GAN 和线性插值不使用气象条件分支，因此不写入该分组表；四种方法的总体比较仍使用 `reconstruction_comparison.csv`。
 
 ### `forecast_support_comparison.csv`
 
