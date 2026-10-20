@@ -6,7 +6,6 @@
   "weather_clusters": 3,
   "point_missing_rates": [0.05],
   "continuous_lengths": [1, 2, 3],
-  "mask_types": ["random_point", "random_continuous"],
   "mask_seed": 20260917,
   "train_seeds": [11, 22, 33],
   "train_max_epochs": 60,
@@ -17,12 +16,17 @@
   "model_dim": 128,
   "transformer_layers": 4,
   "attention_heads": 4,
+  "diffusion_model_dim": 256,
+  "diffusion_layers": 8,
+  "diffusion_heads": 8,
   "diffusion_train_steps": 100,
   "validation_ddim_steps": 10,
   "ddim_steps": 50,
   "ddim_samples": 20,
   "num_workers": 0,
-  "mixed_precision": true,
-  "forecast_hidden_dim": 128,
-  "forecast_epochs": 100
+  "lstm_use_weather": true,
+  "lstm_hidden_dim": 128,
+  "lstm_layers": 2,
+  "lstm_dropout": 0.1,
+  "lstm_bidirectional": true
 }

@@ -11,11 +11,17 @@ def time_embedding(t, dim):
 
 class ConditionalDiffusion(nn.Module):
     """Four-channel conditional diffusion model.
-    The weather variant additionally receives a [B, L, 13] weather tensor.
+    Both diffusion experiments receive a [B, L, 13] weather tensor.
+
+    ``model_dim``, ``layers`` and ``heads`` are supplied by the caller so the
+    two experiments use the same capacity for a fair comparison.
     """
     def __init__(self, model_dim=128, layers=4, heads=4, timesteps=100, use_weather=True, max_length=24):
         super().__init__(); self.use_weather = use_weather; self.timesteps = timesteps
-        self.input = nn.Linear(12 + (13 if use_weather else 0), model_dim)
+        self.input_dim = 12 + (13 if use_weather else 0)
+        if model_dim % heads:
+            raise ValueError(f"model_dim ({model_dim}) must be divisible by heads ({heads})")
+        self.input = nn.Linear(self.input_dim, model_dim)
         self.position = nn.Parameter(torch.zeros(1, max_length, model_dim))
         self.time = nn.Sequential(nn.Linear(model_dim, model_dim * 2), nn.SiLU(), nn.Linear(model_dim * 2, model_dim))
         layer = nn.TransformerEncoderLayer(model_dim, heads, model_dim * 4, dropout=0.1, activation="gelu", batch_first=True, norm_first=True)
