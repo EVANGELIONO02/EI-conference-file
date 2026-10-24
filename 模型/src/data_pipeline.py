@@ -9,6 +9,10 @@ POWER = ["Power_0", "Power_15", "Power_30", "Power_45"]
 # Thirteen weather features: wind speed, sine/cosine direction components,
 # temperature, pressure, and dew point.
 WEATHER = ["WS10_A", "WDSIN10_A", "WDCOS10_A", "WS100_A", "WDSIN100_A", "WDCOS100_A", "WS200_A", "WDSIN200_A", "WDCOS200_A", "Sea_Surface_Temperature_K", "Mean_Sea_Level_Pressure_Pa", "Temperature_2m_K", "Dew_Point_2m_K"]
+# Wind regimes are defined by hub-height wind speed alone.  Clustering on all
+# thirteen meteorological variables is dominated by wind direction, temperature
+# and pressure, which leaves the three "wind" bins overlapping in wind speed.
+WIND_REGIME_KEY = "WS100_A"
 TIME = "Valid_Time"
 
 def _dt(x):
@@ -69,16 +73,19 @@ def build_dataset(data_path: Path, work: Path, cfg):
     for key in WEATHER:
         x = np.array([r[key] for r in splits["train"]]); scalers["weather"][key] = {"mean": float(x.mean()), "std": float(x.std() or 1)}
     out_arrays, indexes, meta = {}, {}, {}
-    train_weather = np.array([[(r[k] - scalers["weather"][k]["mean"]) / scalers["weather"][k]["std"] for k in WEATHER] for r in splits["train"]], dtype=np.float32)
-    # Use K=3 and rename clusters by ascending mean WS100_A.
-    centers, train_labels = _fit_kmeans(train_weather, 3)
-    means = [np.mean([r["WS100_A"] for r, y in zip(splits["train"], train_labels) if y == j]) if np.any(train_labels == j) else np.inf for j in range(3)]
+    wind_index = WEATHER.index(WIND_REGIME_KEY)
+    train_wind = np.array([[r[WIND_REGIME_KEY]] for r in splits["train"]], dtype=np.float32)
+    train_wind = (train_wind - scalers["weather"][WIND_REGIME_KEY]["mean"]) / scalers["weather"][WIND_REGIME_KEY]["std"]
+    # Cluster on hub-height wind speed alone, then order bins ascending.
+    centers, train_labels = _fit_kmeans(train_wind, 3)
+    means = [np.mean(train_wind[train_labels == j]) if np.any(train_labels == j) else np.inf for j in range(3)]
     remap = {int(old): new for new, old in enumerate(np.argsort(means))}
     regimes = ["low_wind", "medium_wind", "high_wind"]
     for split, rows in splits.items():
         p = np.array([[(r[k] - scalers["power"][k]["min"]) / (scalers["power"][k]["max"] - scalers["power"][k]["min"] or 1) for k in POWER] for r in rows], dtype=np.float32)
         w = np.array([[(r[k] - scalers["weather"][k]["mean"]) / scalers["weather"][k]["std"] for k in WEATHER] for r in rows], dtype=np.float32)
-        labels = train_labels if split == "train" else ((w[:, None] - centers[None]) ** 2).sum(2).argmin(1)
+        wind = w[:, wind_index]
+        labels = train_labels if split == "train" else ((wind[:, None] - centers.ravel()[None, :]) ** 2).argmin(1)
         labels = np.array([remap[int(x)] for x in labels], dtype=np.int64)
         # A non-hourly gap starts a new segment; windows stay inside segments.
         segment = np.zeros(len(rows), dtype=np.int32)
