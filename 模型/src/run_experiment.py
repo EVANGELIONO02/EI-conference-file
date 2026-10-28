@@ -4,11 +4,27 @@ from pathlib import Path
 from train_and_evaluate import run
 
 def main():
-    p = argparse.ArgumentParser(); p.add_argument("--config", default="config.json"); p.add_argument("--quick", action="store_true"); args = p.parse_args(); path = Path(args.config)
-    if not path.is_absolute(): path = Path(__file__).resolve().parents[1] / path
-    result = run(path, quick=args.quick)
-    result_dir = path.parent / (Path("results_v2") / "quick" if args.quick else Path("results"))
-    expected = [result_dir / "reconstruction_grouped_comparison.csv"]
-    print(json.dumps({"device": result["device"], "completed": sum(x["status"] == "completed" for x in result["runs"]), "total": len(result["runs"]), "results_exported": all(x.exists() and x.stat().st_size > 0 for x in expected), "result_directory": str(result_dir)}, ensure_ascii=False, indent=2))
+    p = argparse.ArgumentParser(description="Run imputation-then-forecast experiment pipeline")
+    p.add_argument("--config", default="config.json", help="Path to configuration file")
+    p.add_argument("--quick", action="store_true", help="Quick test mode with reduced epochs")
+    args = p.parse_args()
 
-if __name__ == "__main__": main()
+    path = Path(args.config)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parents[1] / path
+
+    result = run(path, quick=args.quick)
+
+    result_dir = path.parent / "results"
+    expected = [result_dir / "forecast_imputation_comparison.csv"]
+
+    print(json.dumps({
+        "device": result["device"],
+        "completed": sum(x["status"] == "completed" for x in result["runs"]),
+        "total": len(result["runs"]),
+        "results_exported": all(x.exists() and x.stat().st_size > 0 for x in expected),
+        "result_directory": str(result_dir)
+    }, ensure_ascii=False, indent=2))
+
+if __name__ == "__main__":
+    main()
