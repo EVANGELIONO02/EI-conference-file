@@ -67,7 +67,6 @@
   "forecast_steps": 12,            // LSTM预测未来长度（小时）
   "lstm_hidden_dim": 427,          // LSTM隐藏层维度
   "lstm_layers": 2,                // LSTM层数
-  "lstm_bidirectional": true,      // 是否使用双向LSTM
   "diffusion_model_dim": 256,      // Diffusion模型维度
   "diffusion_layers": 8,           // Diffusion Transformer层数
   "train_seeds": [11, 22, 33]      // 随机种子（重复实验）
@@ -83,17 +82,11 @@ cd 模型/src
 python run_experiment.py --config ../config.json
 ```
 
-### 快速测试
-
-```bash
-python run_experiment.py --config ../config.json --quick
-```
-
 ## 结果输出
 
 ### 主要结果文件
 
-- `results/forecast_augmentation_comparison.csv`：对比表格（主要结果）
+- `results/forecast_imputation_comparison.csv`：重构方法下游预测对比表格（主要结果）
 
 表格结构示例：
 

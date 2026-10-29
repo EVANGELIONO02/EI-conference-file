@@ -6,14 +6,13 @@ from train_and_evaluate import run
 def main():
     p = argparse.ArgumentParser(description="Run imputation-then-forecast experiment pipeline")
     p.add_argument("--config", default="config.json", help="Path to configuration file")
-    p.add_argument("--quick", action="store_true", help="Quick test mode with reduced epochs")
     args = p.parse_args()
 
     path = Path(args.config)
     if not path.is_absolute():
         path = Path(__file__).resolve().parents[1] / path
 
-    result = run(path, quick=args.quick)
+    result = run(path)
 
     result_dir = path.parent / "results"
     expected = [result_dir / "forecast_imputation_comparison.csv"]
