@@ -10,9 +10,10 @@ def time_embedding(t, dim):
     return torch.nn.functional.pad(out, (0, dim - out.shape[1])) if out.shape[1] < dim else out
 
 class ConditionalDiffusion(nn.Module):
-    """Four-channel conditional diffusion model.
-    The weather-conditioned variant receives [B, L, 13] weather features and
-    [B, L] wind-regime labels (0=low, 1=medium, 2=high). The unconditional
+    """Conditional diffusion model for configurable power channels.
+    The weather-conditioned variant receives dataset-defined weather features and
+    wind-regime labels (0=below cut-in, 1=below rated,
+    2=rated-to-high, 3=above high-wind threshold). The unconditional
     variant receives neither weather features nor wind-regime labels.
 
     ``model_dim``, ``layers`` and ``heads`` are supplied by the caller so the
@@ -20,22 +21,28 @@ class ConditionalDiffusion(nn.Module):
     """
     use_weather = False  # Fixed by the model class, not a runtime option.
 
-    def __init__(self, model_dim=128, layers=4, heads=4, timesteps=100, max_length=24):
+    def __init__(self, model_dim=128, layers=4, heads=4, timesteps=100, max_length=24,
+                 power_channels=1, weather_channels=24):
         super().__init__(); use_weather = self.use_weather; self.timesteps = timesteps
-        self.input_dim = 12 + (13 if use_weather else 0)
+        if power_channels < 1 or weather_channels < 1:
+            raise ValueError("power_channels and weather_channels must be positive")
+        self.power_channels = power_channels
+        self.weather_channels = weather_channels
+        self.input_dim = 3 * power_channels + (weather_channels if use_weather else 0)
         if model_dim % heads:
             raise ValueError(f"model_dim ({model_dim}) must be divisible by heads ({heads})")
         self.input = nn.Linear(self.input_dim, model_dim)
-        self.regime_embedding = nn.Embedding(3, model_dim) if use_weather else None
+        self.num_wind_regimes = 4
+        self.regime_embedding = nn.Embedding(self.num_wind_regimes, model_dim) if use_weather else None
         self.position = nn.Parameter(torch.zeros(1, max_length, model_dim))
         self.time = nn.Sequential(nn.Linear(model_dim, model_dim * 2), nn.SiLU(), nn.Linear(model_dim * 2, model_dim))
         layer = nn.TransformerEncoderLayer(model_dim, heads, model_dim * 4, dropout=0.1, activation="gelu", batch_first=True, norm_first=True)
         self.encoder = nn.TransformerEncoder(layer, layers, norm=nn.LayerNorm(model_dim), enable_nested_tensor=False)
-        self.output = nn.Sequential(nn.LayerNorm(model_dim), nn.Linear(model_dim, model_dim), nn.GELU(), nn.Linear(model_dim, 4))
+        self.output = nn.Sequential(nn.LayerNorm(model_dim), nn.Linear(model_dim, model_dim), nn.GELU(), nn.Linear(model_dim, power_channels))
         beta = torch.linspace(1e-4, .02, timesteps); alpha = 1 - beta; self.register_buffer("alpha_bar", alpha.cumprod(0))
 
     def forward(self, x_t, observed, mask, t, weather=None, regimes=None):
-        # x_t, observed, and mask have shape [B, L, 4].
+        # Power tensors have shape [B, L, power_channels].
         fields = [x_t, observed, mask]
         if self.use_weather:
             if weather is None: raise ValueError("weather-conditioned model requires weather")
@@ -46,8 +53,8 @@ class ConditionalDiffusion(nn.Module):
                 raise ValueError("weather-conditioned model requires per-timestep wind regime labels")
             if regimes.shape != x_t.shape[:2] or regimes.dtype != torch.long:
                 raise ValueError("wind regime labels must be a torch.long tensor of shape [B, L]")
-            if torch.any((regimes < 0) | (regimes > 2)):
-                raise ValueError("wind regime labels must be 0 (low), 1 (medium), or 2 (high)")
+            if torch.any((regimes < 0) | (regimes >= self.regime_embedding.num_embeddings)):
+                raise ValueError(f"wind regime labels must be in [0, {self.num_wind_regimes - 1}]")
             h = h + self.regime_embedding(regimes)
         return self.output(self.encoder(h))
 
@@ -77,5 +84,5 @@ class ConditionalDiffusion(nn.Module):
 
 
 class WeatherConditionalDiffusion(ConditionalDiffusion):
-    """Fixed weather- and wind-regime-conditioned diffusion method."""
+    """Weather- and wind-regime-conditioned diffusion method."""
     use_weather = True

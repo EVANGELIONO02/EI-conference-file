@@ -1,0 +1,25 @@
+{
+  "rows_raw": 61824,
+  "rows_clean": 61824,
+  "duplicates_replaced": 0,
+  "invalid_removed": 0,
+  "low_wind_filter_enabled": false,
+  "low_wind_stopped_removed": 0,
+  "sample_interval_minutes": 15,
+  "split_rows": {
+    "train": 43276,
+    "val": 9274,
+    "test": 9274
+  },
+  "window_counts": {
+    "train": 3605,
+    "val": 771,
+    "test": 771
+  },
+  "segment_counts": {
+    "train": 1,
+    "val": 1,
+    "test": 1
+  },
+  "data_sha256": "3f1c82f6cfc58ef41ce06f5ce15011ce23bcf339933adbd068dd432b368afb42"
+}

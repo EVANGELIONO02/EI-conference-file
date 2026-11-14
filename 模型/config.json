@@ -1,9 +1,19 @@
 {
-  "data_path": "../data/ec_with_power_xxx _clear.csv",
+  "data_path": "../data/nx18_100MW.csv",
+  "work_dir": "work_nx18_100mw",
+  "results_dir": "results_nx18_100mw",
+  "source_time_key": "date",
+  "source_power_key": "实际功率",
+  "source_weather_key_map": {"气温": "air_temperature", "动量通量": "momentum_flux", "30米风向": "wind_dir_30m", "170米风速": "wind_speed_170m", "100米风速": "wind_speed_100m", "30米风速": "wind_speed_30m", "10米风速": "wind_speed_10m", "0米风速": "wind_speed_0m", "170米风向": "wind_dir_170m", "100米风向": "wind_dir_100m", "10米风向": "wind_dir_10m", "0米风向": "wind_dir_0m", "海平面气压": "sea_level_pressure", "云量": "cloud_cover", "感热通量": "sensible_heat_flux", "潜热通量": "latent_heat_flux", "短波辐射": "shortwave_radiation", "长波辐射": "longwave_radiation", "表面气压": "surface_pressure", "未知特征": "unknown_feature", "大尺度降水": "large_scale_precipitation", "对流降水": "convective_precipitation", "2米气温": "temperature_2m", "湿度": "humidity"},
+  "sample_interval_minutes": 15,
+  "power_channels": 1,
+  "low_wind_cut_in_m_s": 3.0,
+  "wind_regime_key": "wind_speed_100m",
+  "wind_regime_thresholds_m_s": [3.0, 11.0, 20.0],
   "window_length": 24,
-  "window_stride": 1,
+  "window_stride": 12,
   "split_ratio": [0.70, 0.15, 0.15],
-  "weather_clusters": 3,
+  "wind_regime_names": ["below_cut_in", "below_rated", "rated_to_high", "above_high_wind"],
   "point_missing_rates": [0.02, 0.05],
   "continuous_lengths": [5, 10],
   "mask_seed": 20260917,
@@ -25,5 +35,6 @@
   "lstm_layers": 2,
   "lstm_dropout": 0.1,
   "forecast_input_steps": 12,
-  "forecast_steps": 12
+  "forecast_steps": 12,
+  "low_wind_filter_enabled": false
 }

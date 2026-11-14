@@ -10,18 +10,23 @@ def main():
 
     path = Path(args.config)
     if not path.is_absolute():
-        path = Path(__file__).resolve().parents[1] / path
+        path = path.resolve() if path.exists() else Path(__file__).resolve().parents[1] / path
 
     result = run(path)
 
-    result_dir = path.parent / "results"
-    expected = [result_dir / "forecast_imputation_comparison.csv"]
+    config = json.loads(path.read_text(encoding="utf-8-sig"))
+    result_dir = (path.parent / config.get("results_dir", "results")).resolve()
+    expected = [
+        result_dir / "forecast_imputation_comparison.csv",
+        result_dir / "imputation_comparison.csv",
+    ]
 
     print(json.dumps({
         "device": result["device"],
         "completed": sum(x["status"] == "completed" for x in result["runs"]),
         "total": len(result["runs"]),
         "results_exported": all(x.exists() and x.stat().st_size > 0 for x in expected),
+        "result_files": {x.name: x.exists() and x.stat().st_size > 0 for x in expected},
         "result_directory": str(result_dir)
     }, ensure_ascii=False, indent=2))
 

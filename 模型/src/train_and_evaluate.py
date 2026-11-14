@@ -17,11 +17,11 @@ import numpy as np, torch
 from tqdm.auto import tqdm
 from torch import nn
 from torch.utils.data import Dataset, DataLoader
-from data_pipeline import POWER, build_dataset
+from data_pipeline import POWER, REGIME_NAMES, WIND_REGIME_THRESHOLDS, WIND_REGIME_KEY, build_dataset
 from diffusion_model import ConditionalDiffusion, WeatherConditionalDiffusion
 from lstm_forecaster import LSTMForecaster
 
-REGIMES = ["low_wind", "medium_wind", "high_wind"]
+REGIMES = REGIME_NAMES
 IMPUTATION_METHODS = ["linear_interpolation", "diffusion_no_weather", "diffusion_with_weather"]
 
 def seed_all(seed):
@@ -42,7 +42,7 @@ def create_row_mask(length, mask_type, mask_value, n_channels, rng):
         length: sequence length (number of timesteps)
         mask_type: 'random_point' or 'random_continuous'
         mask_value: missing rate (0-1) for point, or block length for continuous
-        n_channels: number of channels (4 for power)
+        n_channels: number of power channels
         rng: numpy random generator
 
     Returns:
@@ -55,13 +55,15 @@ def create_row_mask(length, mask_type, mask_value, n_channels, rng):
             n_missing = max(1, int(math.floor(length * mask_value + 0.5)))
             missing_indices = rng.choice(length, n_missing, replace=False)
             mask[missing_indices, ch] = 0
+        elif mask_type == "random_continuous":
+            block_len = max(1, int(mask_value))
+            for region_start in range(0, length, 24):
+                region_end = min(region_start + 24, length)
+                width = min(block_len, region_end - region_start)
+                start = region_start + int(rng.integers(0, region_end - region_start - width + 1))
+                mask[start:start + width, ch] = 0
         else:
-            block_len = int(mask_value)
-            if block_len >= length:
-                mask[:, ch] = 0
-            else:
-                start = int(rng.integers(0, length - block_len + 1))
-                mask[start:start + block_len, ch] = 0
+            raise ValueError(f"unknown mask type: {mask_type}")
 
     return mask
 
@@ -69,11 +71,11 @@ def linear_interpolation(power, mask):
     """Fill missing values by linear interpolation.
 
     Args:
-        power: [length, 4] array with NaN at missing positions
-        mask: [length, 4] array, 1=observed, 0=missing
+        power: [length, channels] array with NaN at missing positions
+        mask: [length, channels] array, 1=observed, 0=missing
 
     Returns:
-        filled: [length, 4] array with NaNs replaced
+        filled: [length, channels] array with NaNs replaced
     """
     filled = power.copy()
     length, n_channels = power.shape
@@ -139,7 +141,9 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
         layers=cfg["diffusion_layers"],
         heads=cfg["diffusion_heads"],
         timesteps=cfg["diffusion_train_steps"],
-        max_length=L
+        max_length=L,
+        power_channels=len(POWER),
+        weather_channels=len(arrays["train"]["weather"][0])
     ).to(device)
 
     opt = torch.optim.AdamW(net.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
@@ -163,7 +167,7 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
             masks = []
             for _ in range(len(p)):
                 mask_type, mask_val = scenarios(cfg)[int(rng.integers(len(scenarios(cfg))))]
-                m = create_row_mask(L, mask_type, mask_val, 4, rng)
+                m = create_row_mask(L, mask_type, mask_val, len(POWER), rng)
                 masks.append(m)
             masks = torch.from_numpy(np.stack(masks)).to(device)
 
@@ -184,18 +188,16 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
             val_rng = np.random.default_rng(seed + epoch)
             for p, w, regimes in tqdm(val_loader, desc="validation", leave=False, unit="batch"):
                 p, w = p.to(device), w.to(device)
-            if use_weather:
-                regimes = regimes.to(device)
+                regimes = regimes.to(device) if use_weather else None
 
                 masks = []
                 for _ in range(len(p)):
                     mask_type, mask_val = scenarios(cfg)[int(val_rng.integers(len(scenarios(cfg))))]
-                    m = create_row_mask(L, mask_type, mask_val, 4, val_rng)
-                    masks.append(m)
+                    masks.append(create_row_mask(L, mask_type, mask_val, len(POWER), val_rng))
                 masks = torch.from_numpy(np.stack(masks)).to(device)
 
                 pred = net.sample(p * masks, masks, w if use_weather else None, cfg["validation_ddim_steps"], 1,
-                                  regimes=regimes if use_weather else None)
+                                  regimes=regimes)
 
                 val_sq += float((((pred - p) ** 2) * (1 - masks)).sum())
                 val_n += int((1 - masks).sum())
@@ -234,6 +236,8 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
         "use_weather": use_weather,
         "uses_wind_regime_labels": use_weather,
         "regime_names": REGIMES if use_weather else [],
+        "wind_regime_key": cfg.get("wind_regime_key", WIND_REGIME_KEY),
+        "wind_regime_thresholds_m_s": cfg.get("wind_regime_thresholds_m_s", WIND_REGIME_THRESHOLDS),
         "trainable_parameters": sum(p.numel() for p in net.parameters() if p.requires_grad),
         "best_val_rmse": best_val
     }, ckpt_path)
@@ -244,30 +248,47 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
 
     return net, device, {"best_val_rmse": best_val, "epochs": len(logs), "checkpoint": str(ckpt_path)}
 
-def impute_row_level_batched(method, diffusion_net, device, power_clean, weather, mask, cfg, regimes=None):
+def impute_row_level_batched(method, diffusion_net, device, power_clean, weather, mask, cfg, regimes=None, segment_ids=None):
     """Impute missing values using batched processing.
 
     Args:
         method: imputation method name
         diffusion_net: trained diffusion model (or None for linear)
         device: torch device
-        power_clean: [length, 4] clean power array (for reference)
-        mask: [length, 4] mask array
+        power_clean: [length, channels] clean power array (for reference)
+        mask: [length, channels] mask array
         cfg: config dict
 
     Returns:
-        imputed: [length, 4] array with missing values filled
+        imputed: [length, channels] array with missing values filled
     """
     length = len(power_clean)
     L = cfg["window_length"]
 
     if method == "linear_interpolation":
-        # Apply mask to create masked version
-        power_masked = power_clean.copy()
-        power_masked[mask == 0] = np.nan
-        return linear_interpolation(power_masked, mask)
+        # Forecasting is causal: do not use a right-hand value after the
+        # forecast origin to fill the last history point. Forward-fill each
+        # channel within each segment instead of retrospective interpolation.
+        segment = (np.asarray(segment_ids) if segment_ids is not None
+                   else np.zeros(length, dtype=np.int32))
+        if segment.shape != (length,):
+            raise ValueError("segment_ids must have one value per row")
+        filled = power_clean.copy()
+        for sid in np.unique(segment):
+            positions = np.flatnonzero(segment == sid)
+            for ch in range(power_clean.shape[1]):
+                last = None
+                for pos in positions:
+                    if mask[pos, ch] > 0:
+                        last = power_clean[pos, ch]
+                    elif last is not None:
+                        filled[pos, ch] = last
+                    else:
+                        filled[pos, ch] = 0.0
+        return filled
 
-    # Diffusion-based imputation: process in non-overlapping windows
+    # Diffusion imputation is applied independently to each causal history
+    # prefix. It never receives the target suffix or later rows.
     if method not in {"diffusion_no_weather", "diffusion_with_weather"}:
         raise ValueError(f"unknown imputation method: {method}")
 
@@ -276,83 +297,86 @@ def impute_row_level_batched(method, diffusion_net, device, power_clean, weather
         if regimes is None or np.asarray(regimes).shape != (length,):
             raise ValueError("weather-conditioned imputation requires one wind regime label per timestep")
         regimes = np.asarray(regimes, dtype=np.int64)
-        if np.any((regimes < 0) | (regimes > 2)):
-            raise ValueError("wind regime labels must be in [0, 2]")
+        if np.any((regimes < 0) | (regimes >= len(REGIMES))):
+            raise ValueError(f"wind regime labels must be in [0, {len(REGIMES) - 1}]")
 
     # Create masked power
     power_masked = power_clean * mask
     weather = np.asarray(weather)
 
-    # Split into non-overlapping windows
-    n_windows = length // L
+    segment = (np.asarray(segment_ids) if segment_ids is not None
+               else np.zeros(length, dtype=np.int32))
+    if segment.shape != (length,):
+        raise ValueError("segment_ids must have one value per row")
+    input_len = int(cfg.get("forecast_input_steps", L // 2))
     imputed = power_clean.copy()
+    starts = []
+    for sid in np.unique(segment):
+        positions = np.flatnonzero(segment == sid)
+        seg_start, seg_end = int(positions[0]), int(positions[-1]) + 1
+        origins = list(range(seg_start + input_len, seg_end + 1, input_len))
+        if not origins or origins[-1] != seg_end:
+            origins.append(seg_end)
+        starts.extend((seg_start, seg_end, int(s)) for s in origins)
 
-    # Batch process windows
-    batch_size = min(256, n_windows)
+    batch_size = min(256, len(starts))
     if batch_size == 0:
-        remainder_masked = power_clean.copy()
-        remainder_masked[mask == 0] = np.nan
-        return linear_interpolation(remainder_masked, mask)
+        return imputed
 
-    for batch_start in tqdm(range(0, n_windows, batch_size), desc=f"Imputing ({method})", leave=False):
-        batch_end = min(batch_start + batch_size, n_windows)
-        batch_windows = []
-        batch_masks = []
-        batch_weathers = []
-        batch_regimes = []
-
-        for w_idx in range(batch_start, batch_end):
-            start = w_idx * L
-            end = start + L
-            batch_windows.append(power_masked[start:end])
-            batch_masks.append(mask[start:end])
-            batch_weathers.append(weather[start:end])
+    for batch_start in tqdm(range(0, len(starts), batch_size), desc=f"Imputing ({method})", leave=False):
+        batch = starts[batch_start:batch_start + batch_size]
+        windows, masks, weathers, regimes_batch = [], [], [], []
+        for seg_start, seg_end, origin in batch:
+            # The model receives only the causal history prefix ending at origin.
+            context_start = max(seg_start, origin - input_len)
+            context_end = origin
+            left_pad = input_len - (origin - context_start)
+            n_channels = power_clean.shape[1]
+            p = np.zeros((L, n_channels), dtype=np.float32)
+            m = np.ones((L, n_channels), dtype=np.float32)
+            w = np.zeros((L, weather.shape[1]), dtype=np.float32)
+            p[left_pad:left_pad + context_end - context_start] = power_masked[context_start:context_end]
+            m[left_pad:left_pad + context_end - context_start] = mask[context_start:context_end]
+            w[left_pad:left_pad + context_end - context_start] = weather[context_start:context_end]
+            windows.append(p); masks.append(m); weathers.append(w)
             if use_weather:
-                batch_regimes.append(regimes[start:end])
+                r = np.zeros(L, dtype=np.int64)
+                r[left_pad:left_pad + context_end - context_start] = regimes[context_start:context_end]
+                regimes_batch.append(r)
 
-        # Stack into batches
-        p_batch = torch.from_numpy(np.stack(batch_windows)).to(device)
-        m_batch = torch.from_numpy(np.stack(batch_masks)).to(device)
-        w_batch = torch.from_numpy(np.stack(batch_weathers)).to(device)
-        r_batch = torch.as_tensor(np.stack(batch_regimes), dtype=torch.long, device=device) if use_weather else None
-
-        # Impute
+        p_batch = torch.from_numpy(np.stack(windows)).to(device)
+        m_batch = torch.from_numpy(np.stack(masks)).to(device)
+        w_batch = torch.from_numpy(np.stack(weathers)).to(device)
+        r_batch = torch.as_tensor(np.stack(regimes_batch), dtype=torch.long, device=device) if use_weather else None
         with torch.no_grad():
-            pred_batch = diffusion_net.sample(
-                p_batch, m_batch,
-                w_batch if use_weather else None,
-                cfg["ddim_steps"],
-                cfg["ddim_samples"],
-                regimes=r_batch
-            )
-
-        # Write back
+            pred_batch = diffusion_net.sample(p_batch, m_batch, w_batch if use_weather else None,
+                                              cfg["ddim_steps"], cfg["ddim_samples"], regimes=r_batch)
         pred_np = pred_batch.cpu().numpy()
-        for i, w_idx in enumerate(range(batch_start, batch_end)):
-            start = w_idx * L
-            end = start + L
-            imputed[start:end] = pred_np[i]
-
-    # Handle remainder (partial window at end)
-    remainder_start = n_windows * L
-    if remainder_start < length:
-        # For simplicity, use linear interpolation for the tail
-        power_masked_tail = power_clean[remainder_start:].copy()
-        power_masked_tail[mask[remainder_start:] == 0] = np.nan
-        imputed[remainder_start:] = linear_interpolation(power_masked_tail, mask[remainder_start:])
+        for i, (seg_start, seg_end, origin) in enumerate(batch):
+            end = origin
+            context_start = max(seg_start, origin - input_len)
+            width = end - context_start
+            left_pad = input_len - width
+            output_offset = left_pad
+            write_mask = mask[context_start:end] == 0
+            chunk = imputed[context_start:end]
+            pred = np.clip(pred_np[i, output_offset:output_offset + width], 0.0, 1.0)
+            chunk[write_mask] = pred[write_mask]
+            imputed[context_start:end] = chunk
 
     return imputed
 
-def create_scenario_masks(arrays, split, cfg, mask_type, mask_value):
+def create_scenario_masks(arrays, split, cfg, mask_type, mask_value, seed=None):
     """Create and save masks for one scenario.
 
     Returns:
-        mask: [length, 4] array saved to disk
+        mask: [length, channels] array saved to disk
     """
     length = len(arrays[split]["power"])
-    rng = np.random.default_rng(cfg["mask_seed"])
+    n_channels = arrays[split]["power"].shape[1]
+    rng = np.random.default_rng(cfg["mask_seed"] if seed is None else seed)
 
-    mask = create_row_mask(length, mask_type, mask_value, 4, rng)
+    mask = create_row_mask(length, mask_type, mask_value, n_channels, rng)
 
     return mask
 
@@ -377,7 +401,7 @@ class ForecastWindowsCleanTarget(Dataset):
         p_target = torch.from_numpy(self.power_clean[s + self.input_len:s + self.total_len])
         return p_input, p_target
 
-def train_lstm_forecaster(power_imputed, arrays, indexes, cfg, work_dir, scenario_name, method, seed):
+def train_lstm_forecaster(power_imputed, val_imputed, arrays, indexes, cfg, work_dir, scenario_name, method, seed):
     """Train LSTM forecaster on imputed data."""
     seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -395,9 +419,9 @@ def train_lstm_forecaster(power_imputed, arrays, indexes, cfg, work_dir, scenari
         power_imputed, arrays["train"]["power"], train_starts, input_len, forecast_len
     )
 
-    # Validation uses clean data (no imputation on val)
+    # Validation uses the same imputed-history/clean-target condition as train.
     val_dataset = ForecastWindowsCleanTarget(
-        arrays["val"]["power"], arrays["val"]["power"], val_starts, input_len, forecast_len
+        val_imputed, arrays["val"]["power"], val_starts, input_len, forecast_len
     )
 
     train_loader = DataLoader(train_dataset, cfg["batch_size"], shuffle=True, num_workers=cfg["num_workers"])
@@ -409,7 +433,8 @@ def train_lstm_forecaster(power_imputed, arrays, indexes, cfg, work_dir, scenari
         forecast_steps=forecast_len,
         hidden_dim=cfg["lstm_hidden_dim"],
         layers=cfg["lstm_layers"],
-        dropout=cfg["lstm_dropout"]
+        dropout=cfg["lstm_dropout"],
+        power_channels=len(POWER)
     ).to(device)
 
     opt = torch.optim.AdamW(net.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
@@ -516,7 +541,7 @@ def evaluate_forecaster(net, device, arrays, indexes, cfg, scales, scenario_name
             all_target.append(p_out.numpy())
 
     # Concatenate
-    all_pred = np.concatenate(all_pred, axis=0)  # [N, forecast_len, 4]
+    all_pred = np.concatenate(all_pred, axis=0)  # [N, forecast_len, channels]
     all_target = np.concatenate(all_target, axis=0)
 
     # Denormalize and compute metrics
@@ -538,14 +563,60 @@ def evaluate_forecaster(net, device, arrays, indexes, cfg, scales, scenario_name
         "scenario": scenario_name,
         "method": method,
         "seed": seed,
-        "abs_error_max": float(np.max(all_errors)),
-        "abs_error_min": float(np.min(all_errors)),
         "MAE": float(np.mean(all_errors)),
         "RMSE": float(np.sqrt(np.mean(all_errors ** 2))),
         "n_points": len(all_errors)
     }
 
     return result
+
+def evaluate_imputation(power_clean, power_imputed, mask, scales, regimes, regime_names=REGIMES, thresholds=WIND_REGIME_THRESHOLDS):
+    """Evaluate masked validation cells overall and by their wind regime."""
+    if power_clean.shape != power_imputed.shape or power_clean.shape != mask.shape:
+        raise ValueError("clean, imputed, and mask arrays must have the same shape")
+    regimes = np.asarray(regimes, dtype=np.int64)
+    regime_names = list(regime_names)
+    thresholds = tuple(float(value) for value in thresholds)
+    if len(regime_names) != len(thresholds) + 1 or len(regime_names) != len(REGIMES):
+        raise ValueError("regime names and thresholds do not match the model's fixed embedding size")
+    if regimes.shape != (power_clean.shape[0],):
+        raise ValueError("one wind regime label is required per validation timestep")
+    if np.any((regimes < 0) | (regimes >= len(REGIMES))):
+        raise ValueError("wind regime labels are outside the configured range")
+
+    missing = mask == 0
+    rows = []
+    for regime_id, regime_name in enumerate(regime_names):
+        errors = []
+        for ch, field in enumerate(POWER):
+            selected = missing[:, ch] & (regimes == regime_id)
+            if not np.any(selected):
+                continue
+            scale = scales["power"][field]
+            span = scale["max"] - scale["min"] or 1
+            truth = power_clean[selected, ch] * span + scale["min"]
+            estimate = power_imputed[selected, ch] * span + scale["min"]
+            errors.append(estimate - truth)
+        values = np.concatenate(errors) if errors else np.array([], dtype=np.float64)
+        rows.append({
+            "regime_id": regime_id,
+            "regime": regime_name,
+            "wind_speed_range_m_s": _regime_range_label(regime_id, thresholds),
+            "imputation_MAE": float(np.mean(np.abs(values))) if values.size else float("nan"),
+            "imputation_RMSE": float(np.sqrt(np.mean(values ** 2))) if values.size else float("nan"),
+            "imputation_n_missing": int(values.size),
+        })
+    return rows
+
+
+def _regime_range_label(regime_id, thresholds=WIND_REGIME_THRESHOLDS):
+    bounds = [0.0, *thresholds, float("inf")]
+    lower, upper = bounds[regime_id:regime_id + 2]
+    lower_text = f"{lower:g}"
+    upper_text = "inf" if not np.isfinite(upper) else f"{upper:g}"
+    left = "[" if regime_id == 0 else "("
+    return f"{left}{lower_text}, {upper_text}] m/s"
+
 
 def write_csv(path, rows):
     """Write CSV with UTF-8 BOM."""
@@ -562,6 +633,26 @@ def write_csv(path, rows):
         w.writeheader()
         w.writerows(rows)
 
+def pivot_imputation_results(imputation_rows):
+    """Pivot validation metrics by scenario, seed, and wind regime."""
+    grouped = {}
+    for row in imputation_rows:
+        key = (row["scenario"], row["seed"], row["regime_id"])
+        grouped.setdefault(key, {
+            "scenario": row["scenario"],
+            "seed": row["seed"],
+            "split": "validation",
+            "regime_id": row["regime_id"],
+            "regime": row["regime"],
+            "wind_speed_range_m_s": row["wind_speed_range_m_s"],
+        })
+        method = row["method"]
+        for metric in ("imputation_MAE", "imputation_RMSE", "imputation_n_missing"):
+            grouped[key][f"{method}_{metric}"] = row[metric]
+
+    return sorted(grouped.values(), key=lambda row: (row["scenario"], row["seed"], row["regime_id"]))
+
+
 def pivot_results(eval_rows):
     """Pivot results: one row per scenario, columns for each method."""
     # Group by scenario and seed
@@ -572,7 +663,7 @@ def pivot_results(eval_rows):
             grouped[key] = {"scenario": row["scenario"], "seed": row["seed"]}
 
         method = row["method"]
-        for metric in ["abs_error_max", "abs_error_min", "MAE", "RMSE"]:
+        for metric in ["MAE", "RMSE"]:
             col = f"{method}_{metric}"
             grouped[key][col] = row[metric]
         grouped[key]["n_points"] = row["n_points"]
@@ -587,9 +678,16 @@ def run(config_path: Path):
     root = config_path.parent
     cfg = json.loads(config_path.read_text(encoding="utf-8-sig"))
 
-    work_dir = root / "work"
-    results_dir = root / "results"
+    work_dir = (root / cfg.get("work_dir", "work")).resolve()
+    results_dir = (root / cfg.get("results_dir", "results")).resolve()
     data_path = (root / cfg["data_path"]).resolve()
+    legacy_dirs = {(root.resolve() / "work").resolve(), (root.resolve() / "results").resolve()}
+    if work_dir in legacy_dirs or results_dir in legacy_dirs:
+        raise ValueError("New-dataset runs must not write into the legacy work/ or results/ directories")
+    if work_dir == results_dir or work_dir in results_dir.parents or results_dir in work_dir.parents:
+        raise ValueError("work_dir and results_dir must be separate directories")
+    if data_path == work_dir or data_path == results_dir:
+        raise ValueError("data_path cannot be an output directory")
 
     # Phase 0: Data preparation
     print("\n" + "=" * 100)
@@ -608,6 +706,12 @@ def run(config_path: Path):
         "device": device_name,
         "audit": audit,
         "config": cfg,
+        "wind_regime": {
+            "feature": cfg.get("wind_regime_key", WIND_REGIME_KEY),
+            "thresholds_m_s": cfg.get("wind_regime_thresholds_m_s", WIND_REGIME_THRESHOLDS),
+            "names": cfg.get("wind_regime_names", REGIMES),
+            "threshold_source": "generic reference thresholds; calibrate to the turbine power curve",
+        },
         "runs": []
     }
 
@@ -659,6 +763,7 @@ def run(config_path: Path):
     print("=" * 100)
 
     eval_rows = []
+    imputation_rows = []
 
     for mask_type, mask_value in scenarios(cfg):
         scenario_name = f"{mask_type}_{mask_value}"
@@ -670,10 +775,11 @@ def run(config_path: Path):
         for seed in cfg["train_seeds"]:
             print(f"\nSeed: {seed}")
 
-            # Create masks (same for all three methods)
+            # Create one shared mask per scenario/seed for all methods.
             print("  Creating masks...")
-            train_mask = create_scenario_masks(arrays, "train", cfg, mask_type, mask_value)
-            val_mask = create_scenario_masks(arrays, "val", cfg, mask_type, mask_value)
+            mask_seed = int(cfg["mask_seed"]) + int(seed)
+            train_mask = create_scenario_masks(arrays, "train", cfg, mask_type, mask_value, mask_seed)
+            val_mask = create_scenario_masks(arrays, "val", cfg, mask_type, mask_value, mask_seed + 1)
 
             # Save masks
             mask_dir = work_dir / "masked" / scenario_name
@@ -695,22 +801,36 @@ def run(config_path: Path):
                         print(f"    Diffusion model unavailable, skipping")
                         continue
 
-                    print(f"    Imputing training data...")
+                    print(f"    Imputing training and validation histories...")
                     train_imputed = impute_row_level_batched(
                         method, diffusion_net, device,
                         arrays["train"]["power"], arrays["train"]["weather"],
-                        train_mask, cfg, regimes=arrays["train"]["cluster"]
+                        train_mask, cfg, regimes=arrays["train"]["cluster"],
+                        segment_ids=arrays["train"]["segment"]
+                    )
+                    val_imputed = impute_row_level_batched(
+                        method, diffusion_net, device,
+                        arrays["val"]["power"], arrays["val"]["weather"],
+                        val_mask, cfg, regimes=arrays["val"]["cluster"],
+                        segment_ids=arrays["val"]["segment"]
+                    )
+                    imputation_metrics = evaluate_imputation(
+                        arrays["val"]["power"], val_imputed, val_mask, scales,
+                        arrays["val"]["cluster"],
+                        cfg.get("wind_regime_names", REGIMES),
+                        cfg.get("wind_regime_thresholds_m_s", WIND_REGIME_THRESHOLDS),
                     )
 
                     # Save imputed data
                     imputed_dir = work_dir / "imputed" / scenario_name / method
                     imputed_dir.mkdir(parents=True, exist_ok=True)
                     np.savez_compressed(imputed_dir / f"train_imputed_seed{seed}.npz", power=train_imputed)
+                    np.savez_compressed(imputed_dir / f"val_imputed_seed{seed}.npz", power=val_imputed)
 
                     # Train LSTM
                     print(f"    Training LSTM forecaster...")
                     lstm_net, lstm_device, lstm_info = train_lstm_forecaster(
-                        train_imputed, arrays, indexes, cfg, work_dir,
+                        train_imputed, val_imputed, arrays, indexes, cfg, work_dir,
                         scenario_name, method, seed
                     )
 
@@ -731,6 +851,13 @@ def run(config_path: Path):
                     )
 
                     eval_rows.append(result)
+                    for regime_metrics in imputation_metrics:
+                        imputation_rows.append({
+                            "scenario": scenario_name,
+                            "seed": seed,
+                            "method": method,
+                            **regime_metrics,
+                        })
 
                     print(f"    ✓ MAE={result['MAE']:.4f}, RMSE={result['RMSE']:.4f}")
 
@@ -764,6 +891,15 @@ def run(config_path: Path):
             print(f"  {len(pivoted)} rows (scenarios × seeds × methods)")
         else:
             print("✗ No evaluation results to export")
+
+        if imputation_rows:
+            imputation_pivoted = pivot_imputation_results(imputation_rows)
+            imputation_path = results_dir / "imputation_comparison.csv"
+            write_csv(imputation_path, imputation_pivoted)
+            print(f"✓ Imputation results exported: {imputation_path}")
+            print(f"  {len(imputation_pivoted)} rows (validation scenarios × seeds)")
+        else:
+            print("✗ No imputation results to export")
 
         # Save run log
         log_path = work_dir / "logs" / "run_summary.json"

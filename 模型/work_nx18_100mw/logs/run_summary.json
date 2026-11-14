@@ -1,0 +1,547 @@
+{
+  "device": "NVIDIA GeForce RTX 4060 Laptop GPU",
+  "audit": {
+    "rows_raw": 61824,
+    "rows_clean": 61824,
+    "duplicates_replaced": 0,
+    "invalid_removed": 0,
+    "low_wind_filter_enabled": false,
+    "low_wind_stopped_removed": 0,
+    "sample_interval_minutes": 15,
+    "split_rows": {
+      "train": 43276,
+      "val": 9274,
+      "test": 9274
+    },
+    "window_counts": {
+      "train": 3605,
+      "val": 771,
+      "test": 771
+    },
+    "segment_counts": {
+      "train": 1,
+      "val": 1,
+      "test": 1
+    },
+    "data_sha256": "3f1c82f6cfc58ef41ce06f5ce15011ce23bcf339933adbd068dd432b368afb42"
+  },
+  "config": {
+    "data_path": "../data/nx18_100MW.csv",
+    "work_dir": "work_nx18_100mw",
+    "results_dir": "results_nx18_100mw",
+    "source_time_key": "date",
+    "source_power_key": "实际功率",
+    "source_weather_key_map": {
+      "气温": "air_temperature",
+      "动量通量": "momentum_flux",
+      "30米风向": "wind_dir_30m",
+      "170米风速": "wind_speed_170m",
+      "100米风速": "wind_speed_100m",
+      "30米风速": "wind_speed_30m",
+      "10米风速": "wind_speed_10m",
+      "0米风速": "wind_speed_0m",
+      "170米风向": "wind_dir_170m",
+      "100米风向": "wind_dir_100m",
+      "10米风向": "wind_dir_10m",
+      "0米风向": "wind_dir_0m",
+      "海平面气压": "sea_level_pressure",
+      "云量": "cloud_cover",
+      "感热通量": "sensible_heat_flux",
+      "潜热通量": "latent_heat_flux",
+      "短波辐射": "shortwave_radiation",
+      "长波辐射": "longwave_radiation",
+      "表面气压": "surface_pressure",
+      "未知特征": "unknown_feature",
+      "大尺度降水": "large_scale_precipitation",
+      "对流降水": "convective_precipitation",
+      "2米气温": "temperature_2m",
+      "湿度": "humidity"
+    },
+    "sample_interval_minutes": 15,
+    "power_channels": 1,
+    "low_wind_cut_in_m_s": 3.0,
+    "wind_regime_key": "wind_speed_100m",
+    "wind_regime_thresholds_m_s": [
+      3.0,
+      11.0,
+      20.0
+    ],
+    "window_length": 24,
+    "window_stride": 12,
+    "split_ratio": [
+      0.7,
+      0.15,
+      0.15
+    ],
+    "wind_regime_names": [
+      "below_cut_in",
+      "below_rated",
+      "rated_to_high",
+      "above_high_wind"
+    ],
+    "point_missing_rates": [
+      0.02,
+      0.05
+    ],
+    "continuous_lengths": [
+      5,
+      10
+    ],
+    "mask_seed": 20260917,
+    "train_seeds": [
+      11,
+      22,
+      33
+    ],
+    "train_max_epochs": 60,
+    "early_stopping_patience": 8,
+    "batch_size": 128,
+    "learning_rate": 0.0003,
+    "weight_decay": 0.0001,
+    "diffusion_model_dim": 256,
+    "diffusion_layers": 8,
+    "diffusion_heads": 8,
+    "diffusion_train_steps": 100,
+    "validation_ddim_steps": 10,
+    "ddim_steps": 50,
+    "ddim_samples": 4,
+    "num_workers": 0,
+    "lstm_hidden_dim": 512,
+    "lstm_layers": 2,
+    "lstm_dropout": 0.1,
+    "forecast_input_steps": 12,
+    "forecast_steps": 12,
+    "low_wind_filter_enabled": false
+  },
+  "wind_regime": {
+    "feature": "wind_speed_100m",
+    "thresholds_m_s": [
+      3.0,
+      11.0,
+      20.0
+    ],
+    "names": [
+      "below_cut_in",
+      "below_rated",
+      "rated_to_high",
+      "above_high_wind"
+    ],
+    "threshold_source": "generic reference thresholds; calibrate to the turbine power curve"
+  },
+  "runs": [
+    {
+      "phase": "diffusion_training",
+      "method": "diffusion_no_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.1787460502180808,
+      "epochs": 32,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\diffusion_no_weather_seed11.pt"
+    },
+    {
+      "phase": "diffusion_training",
+      "method": "diffusion_with_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.1962140125067997,
+      "epochs": 20,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\diffusion_with_weather_seed11.pt"
+    },
+    {
+      "phase": "diffusion_training",
+      "method": "diffusion_no_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.21981447868266873,
+      "epochs": 19,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\diffusion_no_weather_seed22.pt"
+    },
+    {
+      "phase": "diffusion_training",
+      "method": "diffusion_with_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.1998918033172135,
+      "epochs": 25,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\diffusion_with_weather_seed22.pt"
+    },
+    {
+      "phase": "diffusion_training",
+      "method": "diffusion_no_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.2206406491105095,
+      "epochs": 18,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\diffusion_no_weather_seed33.pt"
+    },
+    {
+      "phase": "diffusion_training",
+      "method": "diffusion_with_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.1966573023088787,
+      "epochs": 15,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\diffusion_with_weather_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.02",
+      "method": "linear_interpolation",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.14982239622553498,
+      "epochs": 30,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.02_linear_interpolation_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.02",
+      "method": "diffusion_no_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.1513614477276458,
+      "epochs": 30,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.02_diffusion_no_weather_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.02",
+      "method": "diffusion_with_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.1498159405823218,
+      "epochs": 30,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.02_diffusion_with_weather_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.02",
+      "method": "linear_interpolation",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.1496530601962634,
+      "epochs": 26,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.02_linear_interpolation_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.02",
+      "method": "diffusion_no_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.15271410042928263,
+      "epochs": 26,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.02_diffusion_no_weather_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.02",
+      "method": "diffusion_with_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.1498125646732523,
+      "epochs": 25,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.02_diffusion_with_weather_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.02",
+      "method": "linear_interpolation",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.1495796161595597,
+      "epochs": 31,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.02_linear_interpolation_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.02",
+      "method": "diffusion_no_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.15224304131648977,
+      "epochs": 34,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.02_diffusion_no_weather_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.02",
+      "method": "diffusion_with_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.1509581710409717,
+      "epochs": 31,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.02_diffusion_with_weather_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.05",
+      "method": "linear_interpolation",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.14998920194207296,
+      "epochs": 30,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.05_linear_interpolation_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.05",
+      "method": "diffusion_no_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.15451448593021427,
+      "epochs": 42,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.05_diffusion_no_weather_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.05",
+      "method": "diffusion_with_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.15254327572608217,
+      "epochs": 19,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.05_diffusion_with_weather_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.05",
+      "method": "linear_interpolation",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.14957785104427548,
+      "epochs": 25,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.05_linear_interpolation_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.05",
+      "method": "diffusion_no_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.15475597877961644,
+      "epochs": 26,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.05_diffusion_no_weather_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.05",
+      "method": "diffusion_with_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.15140669127268302,
+      "epochs": 25,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.05_diffusion_with_weather_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.05",
+      "method": "linear_interpolation",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.15039782496940982,
+      "epochs": 26,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.05_linear_interpolation_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.05",
+      "method": "diffusion_no_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.15534924923114918,
+      "epochs": 17,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.05_diffusion_no_weather_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_point_0.05",
+      "method": "diffusion_with_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.15234804194442278,
+      "epochs": 18,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_point_0.05_diffusion_with_weather_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_5",
+      "method": "linear_interpolation",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.15438531019238416,
+      "epochs": 30,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_5_linear_interpolation_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_5",
+      "method": "diffusion_no_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.16232979752148263,
+      "epochs": 19,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_5_diffusion_no_weather_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_5",
+      "method": "diffusion_with_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.1610637319530131,
+      "epochs": 30,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_5_diffusion_with_weather_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_5",
+      "method": "linear_interpolation",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.15499641337768927,
+      "epochs": 25,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_5_linear_interpolation_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_5",
+      "method": "diffusion_no_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.16437804383653248,
+      "epochs": 33,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_5_diffusion_no_weather_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_5",
+      "method": "diffusion_with_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.15961620094338486,
+      "epochs": 25,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_5_diffusion_with_weather_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_5",
+      "method": "linear_interpolation",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.15515369175818647,
+      "epochs": 26,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_5_linear_interpolation_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_5",
+      "method": "diffusion_no_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.16289681102045264,
+      "epochs": 35,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_5_diffusion_no_weather_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_5",
+      "method": "diffusion_with_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.1601008311123102,
+      "epochs": 28,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_5_diffusion_with_weather_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_10",
+      "method": "linear_interpolation",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.1663690439375795,
+      "epochs": 30,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_10_linear_interpolation_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_10",
+      "method": "diffusion_no_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.18057375639890755,
+      "epochs": 19,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_10_diffusion_no_weather_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_10",
+      "method": "diffusion_with_weather",
+      "seed": 11,
+      "status": "completed",
+      "best_val_rmse": 0.17448215435030073,
+      "epochs": 19,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_10_diffusion_with_weather_seed11.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_10",
+      "method": "linear_interpolation",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.1663886220811701,
+      "epochs": 21,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_10_linear_interpolation_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_10",
+      "method": "diffusion_no_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.1726903575884327,
+      "epochs": 60,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_10_diffusion_no_weather_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_10",
+      "method": "diffusion_with_weather",
+      "seed": 22,
+      "status": "completed",
+      "best_val_rmse": 0.17152601849382218,
+      "epochs": 60,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_10_diffusion_with_weather_seed22.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_10",
+      "method": "linear_interpolation",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.16804910743703969,
+      "epochs": 28,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_10_linear_interpolation_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_10",
+      "method": "diffusion_no_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.17930030779440354,
+      "epochs": 46,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_10_diffusion_no_weather_seed33.pt"
+    },
+    {
+      "phase": "lstm_training",
+      "scenario": "random_continuous_10",
+      "method": "diffusion_with_weather",
+      "seed": 33,
+      "status": "completed",
+      "best_val_rmse": 0.17367874771932304,
+      "epochs": 21,
+      "checkpoint": "E:\\学校\\风电EI\\模型\\work_nx18_100mw\\checkpoints\\lstm_random_continuous_10_diffusion_with_weather_seed33.pt"
+    }
+  ]
+}
