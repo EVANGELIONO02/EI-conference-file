@@ -10,10 +10,9 @@ class LSTMForecaster(nn.Module):
     Weather and wind-regime labels are intentionally excluded. The encoder is
     always bidirectional, operating only within the available history window.
     """
-    def __init__(self, input_steps=12, forecast_steps=12, hidden_dim=128,
+    def __init__(self, forecast_steps=12, hidden_dim=128,
                  layers=2, dropout=0.1, power_channels=1):
         super().__init__()
-        self.input_steps = input_steps
         self.forecast_steps = forecast_steps
         if power_channels < 1:
             raise ValueError("power_channels must be positive")
