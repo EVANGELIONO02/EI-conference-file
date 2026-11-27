@@ -84,13 +84,13 @@ class ConditionalDiffusion(nn.Module):
         return self.output(self.encoder(h, src_key_padding_mask=~valid))
 
     def loss_per_sample(self, clean, observed, mask, weather=None, missing_weight=1.0,
-                        regimes=None, valid_mask=None):
+                        regimes=None, valid_mask=None, *, generator=None):
         """Compute noise loss only at real, artificially missing coordinates."""
         valid = self._valid(clean, valid_mask)
         valid3 = valid.unsqueeze(-1)
         batch = clean.shape[0]
-        timesteps = torch.randint(0, self.timesteps, (batch,), device=clean.device)
-        noise = torch.randn_like(clean)
+        timesteps = torch.randint(0, self.timesteps, (batch,), device=clean.device, generator=generator)
+        noise = torch.randn(clean.shape, dtype=clean.dtype, device=clean.device, generator=generator)
         alpha_bar = self.alpha_bar[timesteps].view(batch, 1, 1)
         noisy = alpha_bar.sqrt() * clean + (1 - alpha_bar).sqrt() * noise
         x_t = torch.where(mask.bool(), observed, noisy)
@@ -101,7 +101,7 @@ class ConditionalDiffusion(nn.Module):
         return base * (1 + missing_weight)
 
     @torch.no_grad()
-    def sample(self, observed, mask, weather=None, steps=50, draws=1, regimes=None, valid_mask=None):
+    def sample(self, observed, mask, weather=None, steps=50, draws=1, regimes=None, valid_mask=None, *, generator=None):
         """Run DDIM-style sampling while restoring observed coordinates each step."""
         valid = self._valid(observed, valid_mask)
         valid3 = valid.unsqueeze(-1)
@@ -117,7 +117,8 @@ class ConditionalDiffusion(nn.Module):
         observed_mask = mask.bool()
         results = []
         for _ in range(draws):
-            x = torch.where(observed_mask, observed, torch.randn_like(observed))
+            noise = torch.randn(observed.shape, dtype=observed.dtype, device=observed.device, generator=generator)
+            x = torch.where(observed_mask, observed, noise)
             x = torch.where(valid3, x, 0.0)
             for i, (timestep, alpha_bar) in enumerate(zip(timesteps, alphas)):
                 t = timestep.expand(observed.shape[0])

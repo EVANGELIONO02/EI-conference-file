@@ -1,10 +1,10 @@
 """Training and evaluation pipeline with row-level masking and imputation.
 
-Three methods reconstruct the same masked training and validation power rows.
-Both linear interpolation and diffusion imputation use offline, bidirectional
-observed context within each continuous segment. Diffusion inputs are gap-centered
-windows with real samples only. BiLSTM learns from reconstructed histories and
-clean labels, and is tested on clean histories and labels.
+Diffusion training and forecast training use the same row-mask generator on
+separate time splits. Three methods reconstruct the same masked forecast-training
+rows using offline, bidirectional context within each continuous segment.
+LSTM learns from reconstructed histories and clean labels; validation and test
+histories remain clean.
 """
 from __future__ import annotations
 import csv, json, math, random, traceback
@@ -38,80 +38,63 @@ def _segment_bounds(length, segment_ids):
     return [(int(start), int(end)) for start, end in zip(edges[:-1], edges[1:]) if start < end]
 
 
-def _sample_feasible_gap_location(scenario, segments, rng, min_context=1):
-    """Sample only gaps that fit at least one segment and two real anchors."""
-    if min_context < 1:
-        raise ValueError("min_context must be at least one observed row per side")
-    max_gap = max((end - start - 2 * min_context for start, end in segments), default=0)
-    if max_gap < 1:
-        raise ValueError("no segment is long enough to contain a gap and two observed anchors")
-
-    if scenario["type"] == "point":
-        gap_length = 1
-    elif scenario["type"] == "continuous":
-        buckets = [name for name in ("short", "medium", "long") if f"{name}_lengths" in scenario]
-        probabilities = np.asarray(scenario.get("length_probabilities", []), dtype=np.float64)
-        if (not buckets or probabilities.shape != (len(buckets),)
-                or np.any(probabilities < 0) or not np.isclose(probabilities.sum(), 1.0)):
-            raise ValueError("gap length probabilities must match configured length buckets and sum to 1")
-        feasible = []
-        for bucket, probability in zip(buckets, probabilities):
-            low, high = map(int, scenario[f"{bucket}_lengths"])
-            if low < 1 or high < low:
-                raise ValueError(f"invalid {bucket} gap range: {(low, high)}")
-            feasible_high = min(high, max_gap)
-            if probability > 0 and low <= feasible_high:
-                feasible.append((bucket, float(probability), low, feasible_high))
-        if not feasible:
-            raise ValueError(f"no configured gap-length bucket fits segment maximum {max_gap}")
-        weights = np.asarray([item[1] for item in feasible], dtype=np.float64)
-        weights /= weights.sum()
-        bucket, _, low, high = feasible[int(rng.choice(len(feasible), p=weights))]
-        gap_length = int(rng.integers(low, high + 1))
-    else:
-        raise ValueError(f"unknown scenario type: {scenario['type']}")
-
-    eligible = [(start, end) for start, end in segments
-                if end - start >= gap_length + 2 * min_context]
-    counts = np.asarray([end - start - gap_length - 2 * min_context + 1
-                         for start, end in eligible], dtype=np.float64)
-    if not len(eligible) or counts.sum() <= 0:
-        raise ValueError(f"no segment can fit configured {gap_length}-point gap and context")
-    selected = int(rng.choice(len(eligible), p=counts / counts.sum()))
-    seg_start, seg_end = eligible[selected]
-    first_start = seg_start + min_context
-    gap_start = int(rng.integers(first_start, seg_end - min_context - gap_length + 1))
-    return gap_length, seg_start, seg_end, gap_start
+def _continuous_gap_buckets(scenario):
+    keys = [f"{name}_lengths" for name in ("short", "medium", "long")
+            if f"{name}_lengths" in scenario]
+    weights = np.asarray(scenario["length_probabilities"], dtype=np.float64)
+    if (not keys or weights.shape != (len(keys),)
+            or np.any(weights < 0) or not np.isclose(weights.sum(), 1.0)):
+        raise ValueError("gap length probabilities must match configured length buckets and sum to 1")
+    buckets = []
+    for key, weight in zip(keys, weights):
+        low, high = map(int, scenario[key])
+        if not 2 <= low <= high:
+            raise ValueError(f"invalid {key}: {(low, high)}")
+        if weight > 0:
+            buckets.append((low, high, weight))
+    return buckets
 
 
-def _dynamic_gap_sample(split_arrays, cfg, rng):
-    """Sample a clean gap and up to the configured real context on both sides."""
-    by_type = {scenario["type"]: scenario for scenario in scenarios(cfg)}
-    probabilities = cfg.get("diffusion_scenario_probabilities", {"point": 0.1, "continuous": 0.9})
-    kinds = [kind for kind in ("point", "continuous") if kind in by_type]
-    weights = np.asarray([probabilities.get(kind, 0.0) for kind in kinds], dtype=np.float64)
-    if not kinds or np.any(weights < 0) or weights.sum() <= 0:
-        raise ValueError("diffusion_scenario_probabilities must select configured scenarios")
-    weights /= weights.sum()
-    scenario = by_type[kinds[int(rng.choice(len(kinds), p=weights))]]
+def _gap_windows(mask, segment_ids, context, max_window):
+    """Yield the same whole-gap windows for Diffusion training and imputation."""
+    if context < 1 or max_window < 3:
+        raise ValueError("Diffusion windows need at least one observed row on each side")
+    for seg_start, seg_end in _segment_bounds(len(mask), segment_ids):
+        for channel in range(mask.shape[1]):
+            missing = mask[seg_start:seg_end, channel] == 0
+            edges = np.flatnonzero(np.diff(np.r_[False, missing, False])) + seg_start
+            starts, ends = edges[::2], edges[1::2]
+            for i, (run_start, run_end) in enumerate(zip(starts, ends)):
+                if run_start == seg_start or run_end == seg_end:
+                    raise ValueError(f"missing run [{run_start}, {run_end}) lacks two observed anchors")
+                left = ends[i - 1] if i else seg_start
+                right = starts[i + 1] if i + 1 < len(starts) else seg_end
+                start = max(left, run_start - context)
+                end = min(right, run_end + context)
+                if end - start > max_window:
+                    raise ValueError(
+                        f"missing run [{run_start}, {run_end}) needs a {end - start}-point window, "
+                        f"but the model maximum is {max_window}"
+                    )
+                yield start, end, channel, run_start, run_end
 
+
+def _masked_gap_samples(split_arrays, scenario, cfg, rng):
+    """Visit each gap once per mask, then draw a fresh mask for this scenario."""
     power = split_arrays["power"]
-    segments = _segment_bounds(len(power), split_arrays.get("segment"))
-    gap_length, seg_start, seg_end, gap_start = _sample_feasible_gap_location(
-        scenario, segments, rng, min_context=1
-    )
-    gap_end = gap_start + gap_length
+    segment_ids = split_arrays.get("segment")
     context = int(cfg.get("diffusion_context_points", 18))
-    window_start = max(seg_start, gap_start - context)
-    window_end = min(seg_end, gap_end + context)
-
-    clean = np.asarray(power[window_start:window_end], dtype=np.float32).copy()
-    mask = np.ones_like(clean, dtype=np.float32)
-    mask[gap_start - window_start:gap_end - window_start] = 0
-    observed = clean * mask
-    weather = np.asarray(split_arrays["weather"][window_start:window_end], dtype=np.float32)
-    regimes = np.asarray(split_arrays["cluster"][window_start:window_end], dtype=np.int64)
-    return clean, observed, mask, weather, regimes
+    max_window = int(cfg.get("max_diffusion_window_length", cfg["window_length"] + 2 * context))
+    while True:
+        mask = create_row_mask(scenario, len(power), rng, power.shape[1], segment_ids=segment_ids)
+        windows = list(_gap_windows(mask, segment_ids, context, max_window))
+        rng.shuffle(windows)
+        for start, end, _, _, _ in windows:
+            clean = np.asarray(power[start:end], dtype=np.float32)
+            local_mask = mask[start:end]
+            weather = np.asarray(split_arrays["weather"][start:end], dtype=np.float32)
+            regimes = np.asarray(split_arrays["cluster"][start:end], dtype=np.int64)
+            yield clean, clean * local_mask, local_mask, weather, regimes
 
 def _collate_dynamic_windows(samples):
     """Pad variable-length examples and return a real-position mask."""
@@ -141,10 +124,19 @@ def _dynamic_window_batches(split_arrays, sample_count, cfg, rng, batch_size):
     reference_length = int(cfg["window_length"])
     max_attention_elements = int(batch_size * reference_length ** 2 * 4)
     chunk_size = batch_size * 4
+    by_type = {scenario["type"]: scenario for scenario in scenarios(cfg)}
+    probabilities = cfg.get("diffusion_scenario_probabilities", {"point": 0.1, "continuous": 0.9})
+    kinds = list(by_type)
+    weights = np.asarray([probabilities.get(kind, 0.0) for kind in kinds], dtype=np.float64)
+    if not kinds or not np.isfinite(weights).all() or np.any(weights < 0) or weights.sum() <= 0:
+        raise ValueError("diffusion_scenario_probabilities must select configured scenarios")
+    weights /= weights.sum()
+    pools = [_masked_gap_samples(split_arrays, by_type[kind], cfg, rng) for kind in kinds]
     remaining = sample_count
     while remaining:
         count = min(chunk_size, remaining)
-        samples = [_dynamic_gap_sample(split_arrays, cfg, rng) for _ in range(count)]
+        choices = rng.choice(len(pools), size=count, p=weights)
+        samples = [next(pools[i]) for i in choices]
         samples.sort(key=lambda item: len(item[0]))
         batches = []
         start = 0
@@ -165,8 +157,85 @@ def _dynamic_window_batches(split_arrays, sample_count, cfg, rng, batch_size):
         remaining -= count
 
 
+def _continuous_gap_limits(target, buckets, max_gap):
+    """Choose integer block quotas before drawing lengths or positions."""
+    lows, highs, weights = map(np.asarray, zip(*buckets))
+    lows, highs = lows.astype(int), np.minimum(highs.astype(int), max_gap)
+    if np.any(lows > highs) or target < lows.sum():
+        raise ValueError(f"continuous missing budget ({target} rows) or segment lengths cannot fit every configured gap tier")
+
+    # Prefer a block count that keeps the length draws near their configured midpoints.
+    typical_count = target / np.dot(weights, (lows + highs) / 2)
+    candidates = range(max(len(buckets), math.ceil(target / int(highs.max()))),
+                       target // int(lows.min()) + 1)
+    for count in sorted(candidates, key=lambda n: abs(n - typical_count)):
+        ideal = count * weights
+        quotas = np.floor(ideal).astype(int)
+        order = np.argsort(quotas - ideal, kind="stable")
+        quotas[order[:count - int(quotas.sum())]] += 1
+        # Preserve every positive-weight tier when integer rounding would omit it.
+        for tier in np.flatnonzero(quotas == 0):
+            donor = int(np.argmax(np.where(quotas > 1, quotas - ideal, -np.inf)))
+            quotas[donor] -= 1
+            quotas[tier] = 1
+        if np.dot(quotas, lows) <= target <= np.dot(quotas, highs):
+            return np.repeat(lows, quotas), np.repeat(highs, quotas)
+    raise ValueError(f"continuous missing budget ({target} rows) cannot meet the configured gap quotas")
+
+
+def _plan_continuous_gaps(target, buckets, segments, rng, min_context):
+    """Draw exact-budget lengths, then pack and randomly place the blocks."""
+    capacity = np.asarray([max(0, end - start - min_context) for start, end in segments])
+    max_gap = int(capacity.max(initial=0)) - min_context
+    lows, highs = _continuous_gap_limits(target, buckets, max_gap)
+    if target + len(lows) * min_context > capacity.sum():
+        raise ValueError("continuous gap quotas and observed anchors exceed the available segment capacity")
+
+    # Retry if a random length draw/allocation does not pack into fragmented segments.
+    for _ in range(32):
+        order = rng.permutation(len(lows))
+        remaining, low_left, high_left = target, int(lows.sum()), int(highs.sum())
+        lengths = []
+        for low, high in zip(lows[order], highs[order]):
+            low_left -= int(low)
+            high_left -= int(high)
+            draw = int(rng.integers(max(int(low), remaining - high_left),
+                                    min(int(high), remaining - low_left) + 1))
+            lengths.append(draw)
+            remaining -= draw
+
+        free = capacity.copy()
+        assigned = [[] for _ in segments]
+        for gap in sorted(lengths, reverse=True):
+            cost = gap + min_context
+            eligible = np.flatnonzero(free >= cost)
+            if not eligible.size:
+                break
+            starts = free[eligible] - cost + 1
+            index = int(rng.choice(eligible, p=starts / starts.sum()))
+            assigned[index].append(gap)
+            free[index] -= cost
+        else:
+            placed = []
+            for (start, _), block_lengths, slack in zip(segments, assigned, free):
+                if not block_lengths:
+                    continue
+                rng.shuffle(block_lengths)
+                # Sample a random partition of the slack before, between and after blocks.
+                n = len(block_lengths)
+                bars = np.sort(rng.choice(int(slack) + n, size=n, replace=False))
+                extras = np.diff(np.r_[-1, bars]) - 1
+                cursor = start + min_context
+                for gap, extra in zip(block_lengths, extras):
+                    gap_start = cursor + int(extra)
+                    placed.append((gap_start, gap_start + gap))
+                    cursor = gap_start + gap + min_context
+            return placed
+    raise ValueError("could not place continuous gap quotas within the available segments after 32 attempts")
+
+
 def create_row_mask(scenario, length, rng, n_channels=1, *, segment_ids=None, min_context=1):
-    """Build isolated point or feasible continuous masks for each scenario."""
+    """Build one isolated-point or multi-block mask over an entire split."""
     if scenario["type"] not in {"point", "continuous"}:
         raise ValueError(f"unknown scenario type: {scenario['type']}")
     if length < 1 or n_channels < 1 or min_context < 1:
@@ -201,11 +270,16 @@ def create_row_mask(scenario, length, rng, n_channels=1, *, segment_ids=None, mi
                 break
         return mask
 
-    gap_length, _, _, gap_start = _sample_feasible_gap_location(
-        scenario, segments, rng, min_context=min_context
-    )
-    mask[gap_start:gap_start + gap_length, :] = 0
+    rate = float(scenario["missing_rate"])
+    if not 0 < rate < 1:
+        raise ValueError("continuous missing_rate must be in (0, 1)")
+    target = int(round(length * rate))
+    buckets = _continuous_gap_buckets(scenario)
+    for gap_start, gap_end in _plan_continuous_gaps(target, buckets, segments, rng, min_context):
+        mask[gap_start:gap_end, :] = 0
     return mask
+
+
 def linear_interpolation(power, mask, segment_ids=None):
     """Fill only bounded gaps using the nearest observed values on both sides.
 
@@ -232,6 +306,30 @@ def linear_interpolation(power, mask, segment_ids=None):
             known = np.flatnonzero(observed)
             filled[start + missing, ch] = np.interp(missing, known, power[start + known, ch])
     return filled
+
+
+@torch.no_grad()
+def _evaluate_diffusion_validation(net, device, split_arrays, cfg, sample_count, batch_size,
+                                   validation_seed, *, steps, draws):
+    """Regenerate the same examples, batch order and initial noise at every check."""
+    net.eval()
+    val_rng = np.random.default_rng(validation_seed)
+    val_noise = torch.Generator(device=device).manual_seed(validation_seed)
+    val_abs, val_sq, val_n = 0.0, 0.0, 0
+    for clean, observed, masks, weather, regimes, valid in _dynamic_window_batches(
+            split_arrays, sample_count, cfg, val_rng, batch_size):
+        clean, observed, masks, valid = (x.to(device) for x in (clean, observed, masks, valid))
+        pred = net.sample(
+            observed, masks, weather.to(device) if net.use_weather else None,
+            steps, draws, regimes=regimes.to(device) if net.use_weather else None,
+            valid_mask=valid, generator=val_noise,
+        )
+        missing = (1 - masks) * valid.unsqueeze(-1).to(masks.dtype)
+        error = pred - clean
+        val_abs += float((error.abs() * missing).sum())
+        val_sq += float((error.square() * missing).sum())
+        val_n += int(missing.sum())
+    return val_abs / max(val_n, 1), math.sqrt(val_sq / max(val_n, 1))
 
 
 def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
@@ -281,9 +379,15 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
     batch_size = int(cfg["batch_size"])
     if batch_size < 1:
         raise ValueError("batch_size must be positive")
-    best_val, best_state, stale = float("inf"), None, 0
-    logs = []
+    recheck_top_k = cfg.get("diffusion_validation_recheck_top_k", 0)
+    if type(recheck_top_k) is not int or recheck_top_k < 0:
+        raise ValueError("diffusion_validation_recheck_top_k must be a nonnegative integer")
+    best_val, best_state, best_epoch, stale = float("inf"), None, None, 0
+    candidates, logs = [], []
     rng = np.random.default_rng(seed + 8000)
+    train_noise_seed = seed + 12000
+    train_noise = torch.Generator(device=device).manual_seed(train_noise_seed)
+    validation_seed = seed + 1
 
     print(f"[{method_name} seed={seed}] Training started: {train_samples} dynamic windows/epoch")
 
@@ -298,7 +402,7 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
             regimes = regimes.to(device) if use_weather else None
             loss = net.loss_per_sample(
                 clean, observed, masks, weather if use_weather else None,
-                regimes=regimes, valid_mask=valid
+                regimes=regimes, valid_mask=valid, generator=train_noise
             ).mean()
             opt.zero_grad()
             loss.backward()
@@ -309,32 +413,26 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
             train_seen += current_batch
         avg_train_loss = train_loss_sum / max(train_seen, 1)
 
-        # Validate on freshly sampled dynamic gaps every 3 epochs and at epoch 1.
+        # Pair validation examples and initial noise across methods and epochs.
         if epoch == 1 or epoch % 3 == 0:
-            net.eval()
-            val_sq, val_n = 0.0, 0
-            with torch.no_grad():
-                val_rng = np.random.default_rng(seed + epoch)
-                for clean, observed, masks, weather, regimes, valid in _dynamic_window_batches(
-                        arrays["val"], val_samples, cfg, val_rng, batch_size):
-                    clean, observed = clean.to(device), observed.to(device)
-                    masks, weather = masks.to(device), weather.to(device)
-                    valid = valid.to(device)
-                    regimes = regimes.to(device) if use_weather else None
-                    pred = net.sample(
-                        observed, masks, weather if use_weather else None,
-                        cfg["validation_ddim_steps"], 1, regimes=regimes, valid_mask=valid
-                    )
-                    missing = (1 - masks) * valid.unsqueeze(-1).to(masks.dtype)
-                    val_sq += float((((pred - clean) ** 2) * missing).sum())
-                    val_n += int(missing.sum())
-            val_rmse = math.sqrt(val_sq / max(val_n, 1))
-            logs.append({"epoch": epoch, "train_loss": avg_train_loss, "val_rmse": val_rmse})
-            status = "★BEST" if val_rmse < best_val else f"stale={stale}/{cfg['early_stopping_patience']}"
-            print(f"  Epoch {epoch:3d}: train_loss={avg_train_loss:.6f}, val_rmse={val_rmse:.6f} {status}")
-            if val_rmse < best_val:
-                best_val = val_rmse
-                best_state = {k: v.detach().cpu() for k, v in net.state_dict().items()}
+            val_mae, val_rmse = _evaluate_diffusion_validation(
+                net, device, arrays["val"], cfg, val_samples, batch_size, validation_seed,
+                steps=cfg["validation_ddim_steps"], draws=1,
+            )
+            keep_candidate = recheck_top_k > 0 and math.isfinite(val_mae) and (
+                len(candidates) < recheck_top_k or val_mae < candidates[-1][0]
+            )
+            if val_mae < best_val or keep_candidate:
+                snapshot = {k: v.detach().to(device="cpu", copy=True) for k, v in net.state_dict().items()}
+                if keep_candidate:
+                    candidates.append((val_mae, epoch, snapshot))
+                    candidates.sort(key=lambda item: (item[0], item[1]))
+                    del candidates[recheck_top_k:]
+            logs.append({"epoch": epoch, "train_loss": avg_train_loss, "val_mae": val_mae, "val_rmse": val_rmse})
+            status = "★BEST" if val_mae < best_val else f"stale={stale}/{cfg['early_stopping_patience']}"
+            print(f"  Epoch {epoch:3d}: train_loss={avg_train_loss:.6f}, val_mae={val_mae:.6f}, val_rmse={val_rmse:.6f} {status}")
+            if val_mae < best_val:
+                best_val, best_epoch, best_state = val_mae, epoch, snapshot
                 stale = 0
             else:
                 stale += 1
@@ -342,18 +440,41 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
                     print(f"  Early stopping at epoch {epoch}")
                     break
         else:
-            logs.append({"epoch": epoch, "train_loss": avg_train_loss, "val_rmse": None})
+            logs.append({"epoch": epoch, "train_loss": avg_train_loss, "val_mae": None, "val_rmse": None})
     if best_state is None:
         raise RuntimeError(f"{method_name} training produced no checkpoint")
 
-    net.load_state_dict(best_state)
+    selected_epoch, selected_mae, selected_state = best_epoch, best_val, best_state
+    rechecks = []
+    for _, candidate_epoch, candidate_state in candidates:
+        net.load_state_dict(candidate_state)
+        mae, rmse = _evaluate_diffusion_validation(
+            net, device, arrays["val"], cfg, val_samples, batch_size, validation_seed,
+            steps=cfg["ddim_steps"], draws=cfg["ddim_samples"],
+        )
+        if not math.isfinite(mae) or not math.isfinite(rmse):
+            raise RuntimeError(f"{method_name} produced nonfinite validation metrics at epoch {candidate_epoch}")
+        rechecks.append({"epoch": candidate_epoch, "mae": mae, "rmse": rmse})
+        print(f"  DDIM recheck epoch {candidate_epoch}: val_mae={mae:.6f}, val_rmse={rmse:.6f}")
+    if rechecks:
+        selected = min(rechecks, key=lambda row: (row["mae"], row["epoch"]))
+        selected_epoch, selected_mae = selected["epoch"], selected["mae"]
+        selected_state = next(state for _, epoch, state in candidates if epoch == selected_epoch)
+
+    net.load_state_dict(selected_state)
     net.eval()
+    selection = {
+        "best_val_mae": best_val, "best_validation_epoch": best_epoch,
+        "selected_epoch": selected_epoch, "selected_val_mae": selected_mae,
+        "validation_seed": validation_seed, "train_noise_seed": train_noise_seed,
+        "validation_rechecks": rechecks,
+    }
 
     # Save checkpoint
     ckpt_path = work_dir / "checkpoints" / f"{method_name}_seed{seed}.pt"
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "state_dict": best_state,
+        "state_dict": selected_state,
         "method": method_name,
         "seed": seed,
         "use_weather": use_weather,
@@ -364,16 +485,16 @@ def train_diffusion_imputer(arrays, indexes, cfg, work_dir, seed, method_name):
         "trainable_parameters": sum(p.numel() for p in net.parameters() if p.requires_grad),
         "max_diffusion_window_length": max_length,
         "diffusion_context_points": int(cfg.get("diffusion_context_points", 18)),
-        "best_val_rmse": best_val
+        **selection,
     }, ckpt_path)
 
     # Save training log
     log_path = work_dir / "logs" / f"train_{method_name}_seed{seed}.csv"
     write_csv(log_path, logs)
 
-    return net, device, {"best_val_rmse": best_val, "epochs": len(logs), "checkpoint": str(ckpt_path)}
+    return net, device, {**selection, "epochs": len(logs), "checkpoint": str(ckpt_path)}
 
-def impute_row_level_batched(method, diffusion_net, device, power_clean, weather, mask, cfg, regimes=None, segment_ids=None):
+def impute_row_level_batched(method, diffusion_net, device, power_clean, weather, mask, cfg, regimes=None, segment_ids=None, *, noise_seed=None):
     """Impute each full masked run with the configured real context on each side."""
     power_clean = np.asarray(power_clean)
     mask = np.asarray(mask)
@@ -401,63 +522,25 @@ def impute_row_level_batched(method, diffusion_net, device, power_clean, weather
         if np.any((regimes < 0) | (regimes >= len(REGIMES))):
             raise ValueError(f"wind regime labels must be in [0, {len(REGIMES) - 1}]")
 
-    segment = (np.asarray(segment_ids) if segment_ids is not None
-               else np.zeros(length, dtype=np.int32))
-    if segment.shape != (length,):
-        raise ValueError("segment_ids must have one value per row")
     context = int(cfg.get("diffusion_context_points", 18))
     max_window = min(
         int(cfg.get("max_diffusion_window_length", diffusion_net.position.shape[1])),
         int(diffusion_net.position.shape[1]),
     )
-    if context < 0 or max_window < 3:
-        raise ValueError("diffusion context must be nonnegative and max window must be at least 3")
 
     # Zero only explicitly missing coordinates; all context rows remain real values.
     power_masked = np.where(mask.astype(bool), power_clean, 0.0).astype(np.float32, copy=False)
     imputed = np.where(mask.astype(bool), power_clean, np.nan).astype(np.float32, copy=False)
     windows = {}
-    for seg_start, seg_end in _segment_bounds(length, segment):
-        if seg_end - seg_start < 3:
-            if np.any(mask[seg_start:seg_end] == 0):
-                raise ValueError(f"segment [{seg_start}, {seg_end}) is too short for bidirectional imputation")
-            continue
-        for channel in range(power_clean.shape[1]):
-            missing_positions = np.flatnonzero(mask[seg_start:seg_end, channel] == 0) + seg_start
-            if not missing_positions.size:
-                continue
-            breaks = np.flatnonzero(np.diff(missing_positions) > 1) + 1
-            for run in np.split(missing_positions, breaks):
-                run_start, run_end = int(run[0]), int(run[-1]) + 1
-                if (run_start <= seg_start or run_end >= seg_end
-                        or mask[run_start - 1, channel] != 1
-                        or mask[run_end, channel] != 1):
-                    raise ValueError(f"missing run [{run_start}, {run_end}) lacks two observed anchors")
-
-                left_count = 0
-                cursor = run_start - 1
-                while cursor >= seg_start and mask[cursor, channel] == 1 and left_count < context:
-                    left_count += 1
-                    cursor -= 1
-                right_count = 0
-                cursor = run_end
-                while cursor < seg_end and mask[cursor, channel] == 1 and right_count < context:
-                    right_count += 1
-                    cursor += 1
-                window_start = run_start - left_count
-                window_end = run_end + right_count
-                window_len = window_end - window_start
-                if window_len > max_window:
-                    raise ValueError(
-                        f"missing run [{run_start}, {run_end}) needs a {window_len}-point window, "
-                        f"but the model maximum is {max_window}"
-                    )
-                key = (window_start, window_end)
-                windows.setdefault(key, []).append((channel, run_start, run_end))
+    for start, end, channel, run_start, run_end in _gap_windows(mask, segment_ids, context, max_window):
+        windows.setdefault((start, end), []).append((channel, run_start, run_end))
 
     if not windows:
         return power_clean.copy()
 
+    # Restart the same independent noise stream for each paired imputation method.
+    noise_generator = (torch.Generator(device=device).manual_seed(noise_seed)
+                       if noise_seed is not None else None)
     window_items = list(windows.items())
     batch_size = max(1, int(cfg.get("diffusion_imputation_batch_size", 32)))
     for current_window_len in sorted({end - start for (start, end), _ in window_items}):
@@ -482,7 +565,7 @@ def impute_row_level_batched(method, diffusion_net, device, power_clean, weather
             with torch.no_grad():
                 pred_batch = diffusion_net.sample(
                     p_tensor, m_tensor, w_tensor if use_weather else None,
-                    cfg["ddim_steps"], cfg["ddim_samples"], regimes=r_tensor
+                    cfg["ddim_steps"], cfg["ddim_samples"], regimes=r_tensor, generator=noise_generator
                 )
             predictions = pred_batch.detach().cpu().numpy()
             for batch_index, ((window_start, window_end), jobs) in enumerate(batch):
@@ -499,17 +582,12 @@ def impute_row_level_batched(method, diffusion_net, device, power_clean, weather
     if not np.array_equal(imputed[mask == 1], clean_float[mask == 1]):
         raise RuntimeError("diffusion imputation unexpectedly changed observed power values")
     return imputed
-def create_scenario_masks(arrays, split, cfg, scenario, seed=None):
-    """Build a shared artificial mask for one forecast-data split."""
-    if split not in {"train", "val"}:
-        raise ValueError("artificial masks are restricted to training and validation splits")
-    length = len(arrays[split]["power"])
-    n_channels = arrays[split]["power"].shape[1]
-    rng = np.random.default_rng(cfg["mask_seed"] if seed is None else seed)
-
-    return create_row_mask(scenario, length, rng,
-                           n_channels=n_channels,
-                           segment_ids=arrays[split]["segment"])
+def create_forecast_train_mask(arrays, scenario, seed):
+    """Mask only the LSTM training split, identically for all imputation methods."""
+    train = arrays["train"]
+    length, n_channels = train["power"].shape
+    return create_row_mask(scenario, length, np.random.default_rng(seed),
+                           n_channels=n_channels, segment_ids=train["segment"])
 
 class ForecastWindowsCleanTarget(Dataset):
     """Dataset that uses imputed input but clean target labels."""
@@ -531,8 +609,19 @@ class ForecastWindowsCleanTarget(Dataset):
         p_target = torch.from_numpy(self.power_clean[s + self.input_len:s + self.total_len])
         return p_input, p_target
 
-def train_lstm_forecaster(power_imputed, val_imputed, arrays, indexes, cfg, work_dir, scenario_name, method, seed):
-    """Train LSTM forecaster on imputed data."""
+def _new_lstm_forecaster(cfg):
+    return LSTMForecaster(
+        forecast_steps=cfg["forecast_steps"],
+        hidden_dim=cfg["lstm_hidden_dim"],
+        layers=cfg["lstm_layers"],
+        dropout=cfg["lstm_dropout"],
+        power_channels=len(POWER),
+    )
+
+
+def train_lstm_forecaster(power_imputed, arrays, indexes, cfg, work_dir, scenario_name, method, seed,
+                          *, initial_state):
+    """Train on repaired histories and select weights using clean validation data."""
     seed_all(seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -549,31 +638,36 @@ def train_lstm_forecaster(power_imputed, val_imputed, arrays, indexes, cfg, work
         power_imputed, arrays["train"]["power"], train_starts, input_len, forecast_len
     )
 
-    # Validation uses the same imputed-history/clean-target condition as train.
-    val_dataset = ForecastWindowsCleanTarget(
-        val_imputed, arrays["val"]["power"], val_starts, input_len, forecast_len
+    # Validation uses the original power for both histories and targets.
+    val_power = arrays["val"]["power"]
+    val_dataset = ForecastWindowsCleanTarget(val_power, val_power, val_starts, input_len, forecast_len)
+
+    shuffle_seed = seed + 16000
+    train_loader = DataLoader(
+        train_dataset, cfg["batch_size"], shuffle=True, num_workers=cfg["num_workers"],
+        generator=torch.Generator().manual_seed(shuffle_seed),
+    )
+    val_loader = DataLoader(
+        val_dataset, cfg["batch_size"], shuffle=False, num_workers=cfg["num_workers"],
+        generator=torch.Generator().manual_seed(seed + 17000),
     )
 
-    train_loader = DataLoader(train_dataset, cfg["batch_size"], shuffle=True, num_workers=cfg["num_workers"])
-    val_loader = DataLoader(val_dataset, cfg["batch_size"], shuffle=False, num_workers=cfg["num_workers"])
-
-    # Model
-    net = LSTMForecaster(
-        forecast_steps=forecast_len,
-        hidden_dim=cfg["lstm_hidden_dim"],
-        layers=cfg["lstm_layers"],
-        dropout=cfg["lstm_dropout"],
-        power_channels=len(POWER)
-    ).to(device)
+    net = _new_lstm_forecaster(cfg)
+    net.load_state_dict(initial_state)
+    net.to(device)
 
     opt = torch.optim.AdamW(net.parameters(), lr=cfg["learning_rate"], weight_decay=cfg["weight_decay"])
 
-    best_val, best_state, stale = float("inf"), None, 0
+    fixed_epochs = cfg.get("lstm_fixed_epochs")
+    if fixed_epochs is not None and (type(fixed_epochs) is not int or fixed_epochs < 1):
+        raise ValueError("lstm_fixed_epochs must be null or a positive integer")
+    max_epochs = cfg["train_max_epochs"] if fixed_epochs is None else fixed_epochs
+    best_val, best_state, best_epoch, stale = float("inf"), None, None, 0
     logs = []
 
     print(f"[LSTM {scenario_name}/{method} seed={seed}] Training started: {len(train_starts)} windows")
 
-    for epoch in range(1, cfg["train_max_epochs"] + 1):
+    for epoch in range(1, max_epochs + 1):
         net.train()
         train_loss = 0.0
 
@@ -591,57 +685,75 @@ def train_lstm_forecaster(power_imputed, val_imputed, arrays, indexes, cfg, work
 
         # Validation
         net.eval()
-        val_sq, val_n = 0.0, 0
+        val_abs, val_sq, val_n = 0.0, 0.0, 0
         with torch.no_grad():
             for p_in, p_out in val_loader:
                 p_in, p_out = p_in.to(device), p_out.to(device)
 
                 pred = net(p_in)
 
-                val_sq += float(((pred - p_out) ** 2).sum())
+                error = pred - p_out
+                val_abs += float(error.abs().sum())
+                val_sq += float(error.square().sum())
                 val_n += int(p_out.numel())
 
+        val_mae = val_abs / max(val_n, 1)
         val_rmse = math.sqrt(val_sq / max(val_n, 1))
         avg_train_loss = train_loss / max(len(train_loader), 1)
 
-        logs.append({"epoch": epoch, "train_loss": avg_train_loss, "val_rmse": val_rmse})
+        logs.append({"epoch": epoch, "train_loss": avg_train_loss, "val_mae": val_mae, "val_rmse": val_rmse})
 
-        status = "★BEST" if val_rmse < best_val else f"stale={stale}/{cfg['early_stopping_patience']}"
-        if epoch % 5 == 0 or val_rmse < best_val:  # Print every 5 epochs or on new best
-            print(f"  Epoch {epoch:3d}: train_loss={avg_train_loss:.6f}, val_rmse={val_rmse:.6f} {status}")
+        status = "★BEST" if val_mae < best_val else f"stale={stale}/{cfg['early_stopping_patience']}"
+        if epoch % 5 == 0 or val_mae < best_val:  # Print every 5 epochs or on new best
+            print(f"  Epoch {epoch:3d}: train_loss={avg_train_loss:.6f}, val_mae={val_mae:.6f}, val_rmse={val_rmse:.6f} {status}")
 
-        if val_rmse < best_val:
-            best_val = val_rmse
-            best_state = {k: v.detach().cpu() for k, v in net.state_dict().items()}
+        if val_mae < best_val:
+            best_val, best_epoch = val_mae, epoch
+            if fixed_epochs is None:
+                best_state = {k: v.detach().to(device="cpu", copy=True) for k, v in net.state_dict().items()}
             stale = 0
-        else:
+        elif fixed_epochs is None:
             stale += 1
             if stale >= cfg["early_stopping_patience"]:
                 print(f"  Early stopping at epoch {epoch}")
                 break
 
-    if best_state is None:
-        raise RuntimeError(f"LSTM training produced no checkpoint")
+    if best_epoch is None:
+        raise RuntimeError(f"{method} training produced no checkpoint")
 
-    net.load_state_dict(best_state)
+    if fixed_epochs is None:
+        selected_epoch, selected_mae, selected_state = best_epoch, best_val, best_state
+        net.load_state_dict(selected_state)
+    else:
+        # A fixed budget evaluates the final weights, not an earlier best epoch.
+        selected_epoch, selected_mae = len(logs), logs[-1]["val_mae"]
+        if not math.isfinite(selected_mae):
+            raise RuntimeError(f"{method} produced nonfinite validation MAE at the fixed budget")
+        selected_state = {k: v.detach().to(device="cpu", copy=True) for k, v in net.state_dict().items()}
     net.eval()
+    selection = {
+        "best_val_mae": best_val, "best_validation_epoch": best_epoch,
+        "selected_epoch": selected_epoch, "selected_val_mae": selected_mae,
+        "optimizer_steps": len(logs) * len(train_loader), "shuffle_seed": shuffle_seed,
+        "checkpoint_selection": "best_validation_mae" if fixed_epochs is None else "last_fixed_epoch",
+    }
 
     # Save checkpoint
     ckpt_path = work_dir / "checkpoints" / f"lstm_{scenario_name}_{method}_seed{seed}.pt"
     ckpt_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save({
-        "state_dict": best_state,
+        "state_dict": selected_state,
         "scenario": scenario_name,
         "method": method,
         "seed": seed,
-        "best_val_rmse": best_val
+        **selection,
     }, ckpt_path)
 
     # Save log
     log_path = work_dir / "logs" / f"train_lstm_{scenario_name}_{method}_seed{seed}.csv"
     write_csv(log_path, logs)
 
-    return net, device, {"best_val_rmse": best_val, "epochs": len(logs), "checkpoint": str(ckpt_path)}
+    return net, device, {**selection, "epochs": len(logs), "checkpoint": str(ckpt_path)}
 
 def evaluate_forecaster(net, device, arrays, indexes, cfg, scales, scenario_name, method, seed):
     """Evaluate LSTM forecaster on clean test set."""
@@ -740,12 +852,11 @@ def evaluate_imputation(power_clean, power_imputed, mask, scales, regimes, regim
 
 
 def _regime_range_label(regime_id, thresholds=WIND_REGIME_THRESHOLDS):
-    bounds = [0.0, *thresholds, float("inf")]
+    # Match np.digitize(..., right=False): each finite lower bound is inclusive.
+    bounds = [float("-inf"), *thresholds, float("inf")]
     lower, upper = bounds[regime_id:regime_id + 2]
-    lower_text = f"{lower:g}"
-    upper_text = "inf" if not np.isfinite(upper) else f"{upper:g}"
-    left = "[" if regime_id == 0 else "("
-    return f"{left}{lower_text}, {upper_text}] m/s"
+    left = "(" if regime_id == 0 else "["
+    return f"{left}{lower:g}, {upper:g}) m/s"
 
 
 def write_csv(path, rows):
@@ -844,25 +955,13 @@ def run(config_path: Path):
 
     work_dir = (root / cfg.get("work_dir", "work")).resolve()
     results_dir = (root / cfg.get("results_dir", "results")).resolve()
-    diffusion_path = (root / cfg["diffusion_data_path"]).resolve(strict=True)
-    forecast_path = (root / cfg["forecast_data_path"]).resolve(strict=True)
-    if diffusion_path.samefile(forecast_path):
-        raise ValueError("diffusion and forecast datasets must be separate files")
+    data_path = (root / cfg["data_path"]).resolve(strict=True)
     if work_dir == results_dir or work_dir in results_dir.parents or results_dir in work_dir.parents:
         raise ValueError("work_dir and results_dir must be separate directories")
 
     diffusion_work_dir = work_dir / "diffusion"
-    forecast_work_dir = work_dir / "forecast"
-    print(f"Diffusion training and validation: {diffusion_path.name}")
-    diffusion_arrays, diffusion_indexes, source_scales, diffusion_audit = build_dataset(
-        diffusion_path, diffusion_work_dir, cfg
-    )
-    print(f"BiLSTM training, validation and test: {forecast_path.name}")
-    arrays, indexes, scales, forecast_audit = build_dataset(
-        forecast_path, forecast_work_dir, cfg, scalers_override=source_scales
-    )
-    if diffusion_audit["data_sha256"] == forecast_audit["data_sha256"]:
-        raise ValueError("diffusion and forecast datasets contain identical data")
+    print(f"Single-turbine experiment: {data_path.name} (first half Diffusion, second half LSTM)")
+    diffusion_arrays, diffusion_indexes, arrays, indexes, scales, audit = build_dataset(data_path, work_dir, cfg)
     for stage, starts, splits in (
         ("diffusion", diffusion_indexes, ("train", "val")),
         ("forecast", indexes, ("train", "val", "test")),
@@ -877,7 +976,8 @@ def run(config_path: Path):
     log = {
         "device": device_name,
         "status": "running",
-        "audit": {"diffusion": diffusion_audit, "forecast": forecast_audit},
+        "audit": audit,
+        "metric_splits": {"imputation": "forecast/train", "forecast": "forecast/test"},
         "config": cfg,
         "wind_regime": {
             "feature": cfg.get("wind_regime_key", WIND_REGIME_KEY),
@@ -908,6 +1008,7 @@ def run(config_path: Path):
                     diffusion_arrays, diffusion_indexes, cfg, diffusion_work_dir, seed, method
                 )
 
+                net.requires_grad_(False)
                 diffusion_models[(seed, method)] = (net, device)
 
                 log["runs"].append({
@@ -918,7 +1019,7 @@ def run(config_path: Path):
                     **info
                 })
 
-                print(f"✓ Completed: val_rmse={info['best_val_rmse']:.6f}, epochs={info['epochs']}")
+                print(f"✓ Completed: val_mae={info['best_val_mae']:.6f}, epochs={info['epochs']}")
                 export_results(results_dir, work_dir, [], [], log)
 
             except Exception as e:
@@ -943,6 +1044,7 @@ def run(config_path: Path):
     export_results(results_dir, work_dir, eval_rows, imputation_rows, log)
     print(f"Partial result files will be updated under: {results_dir}")
 
+    lstm_initial_states = {}
     for scenario in scenarios(cfg):
         scenario_name = scenario["name"]
 
@@ -952,22 +1054,35 @@ def run(config_path: Path):
 
         for seed in cfg["train_seeds"]:
             print(f"\nSeed: {seed}")
+            if seed not in lstm_initial_states:
+                seed_all(seed)
+                lstm_initial_states[seed] = _new_lstm_forecaster(cfg).state_dict()
 
-            # Create one shared mask per scenario/seed for all methods.
-            print("  Creating masks...")
+            # Create one training mask per scenario/seed, shared by all methods.
             mask_seed = int(cfg["mask_seed"]) + int(seed)
-            train_mask = create_scenario_masks(arrays, "train", cfg, scenario, mask_seed)
-            val_mask = create_scenario_masks(arrays, "val", cfg, scenario, mask_seed + 1)
-
-            # Save masks
+            train_mask = create_forecast_train_mask(arrays, scenario, mask_seed)
             mask_dir = work_dir / "masked" / scenario_name
             mask_dir.mkdir(parents=True, exist_ok=True)
             np.savez_compressed(mask_dir / f"train_mask_seed{seed}.npz", mask=train_mask)
-            np.savez_compressed(mask_dir / f"val_mask_seed{seed}.npz", mask=val_mask)
 
             n_missing_train = int((train_mask == 0).sum())
             n_total_train = train_mask.size
             print(f"  Train mask: {n_missing_train}/{n_total_train} missing ({n_missing_train/n_total_train*100:.2f}%)")
+
+            if scenario["type"] == "continuous":
+                windows = _gap_windows(train_mask[:, :1], arrays["train"]["segment"], 1,
+                                       int(cfg["max_diffusion_window_length"]))
+                lengths = [int(end - start) for _, _, _, start, end in windows]
+                counts = {}
+                for tier in ("short", "medium", "long"):
+                    if f"{tier}_lengths" in scenario:
+                        low, high = scenario[f"{tier}_lengths"]
+                        counts[tier] = sum(low <= gap <= high for gap in lengths)
+                log.setdefault("forecast_train_mask_stats", []).append({
+                    "scenario": scenario_name, "seed": seed, "missing_rows": sum(lengths),
+                    "missing_rate": sum(lengths) / len(train_mask), "gap_counts": counts,
+                })
+                print(f"  Continuous gap counts: {counts}")
 
             # Three imputation methods
             for method in IMPUTATION_METHODS:
@@ -979,22 +1094,16 @@ def run(config_path: Path):
                         print(f"    Diffusion model unavailable, skipping")
                         continue
 
-                    print(f"    Imputing training and validation histories...")
+                    print("    Imputing LSTM training histories only...")
                     train_imputed = impute_row_level_batched(
                         method, diffusion_net, device,
                         arrays["train"]["power"], arrays["train"]["weather"],
                         train_mask, cfg, regimes=arrays["train"]["cluster"],
-                        segment_ids=arrays["train"]["segment"]
-                    )
-                    val_imputed = impute_row_level_batched(
-                        method, diffusion_net, device,
-                        arrays["val"]["power"], arrays["val"]["weather"],
-                        val_mask, cfg, regimes=arrays["val"]["cluster"],
-                        segment_ids=arrays["val"]["segment"]
+                        segment_ids=arrays["train"]["segment"], noise_seed=mask_seed
                     )
                     imputation_metrics = evaluate_imputation(
-                        arrays["val"]["power"], val_imputed, val_mask, scales,
-                        arrays["val"]["cluster"],
+                        arrays["train"]["power"], train_imputed, train_mask, scales,
+                        arrays["train"]["cluster"],
                         cfg.get("wind_regime_names", REGIMES),
                         cfg.get("wind_regime_thresholds_m_s", WIND_REGIME_THRESHOLDS),
                     )
@@ -1017,13 +1126,12 @@ def run(config_path: Path):
                     imputed_dir = work_dir / "imputed" / scenario_name / method
                     imputed_dir.mkdir(parents=True, exist_ok=True)
                     np.savez_compressed(imputed_dir / f"train_imputed_seed{seed}.npz", power=train_imputed)
-                    np.savez_compressed(imputed_dir / f"val_imputed_seed{seed}.npz", power=val_imputed)
 
                     # Train LSTM
                     print(f"    Training LSTM forecaster...")
                     lstm_net, lstm_device, lstm_info = train_lstm_forecaster(
-                        train_imputed, val_imputed, arrays, indexes, cfg, work_dir,
-                        scenario_name, method, seed
+                        train_imputed, arrays, indexes, cfg, work_dir,
+                        scenario_name, method, seed, initial_state=lstm_initial_states[seed],
                     )
 
                     log["runs"].append({

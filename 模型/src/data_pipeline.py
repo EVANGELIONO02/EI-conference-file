@@ -46,11 +46,20 @@ def wind_regime_labels(wind_speed, thresholds=WIND_REGIME_THRESHOLDS):
         raise ValueError("exactly three increasing finite wind regime thresholds are required")
     return np.digitize(values, thresholds).astype(np.int64)
 
-def build_dataset(data_path: Path, work: Path, cfg, scalers_override=None):
-    """Clean data, split time ranges, normalize features, label wind regimes,
-    and create windows that never cross time gaps."""
-    (work / "data" / "clustered").mkdir(parents=True, exist_ok=True)
-    (work / "windows").mkdir(parents=True, exist_ok=True)
+def _split_chronologically(rows, names, ratios, key):
+    if (len(ratios) != len(names) or any(not np.isfinite(x) or x <= 0 for x in ratios)
+            or not np.isclose(sum(ratios), 1.0)):
+        raise ValueError(f"{key} must contain {len(names)} positive shares summing to 1")
+    boundaries = [0, *(int(len(rows) * sum(ratios[:i])) for i in range(1, len(names))), len(rows)]
+    splits = {name: rows[boundaries[i]:boundaries[i + 1]] for i, name in enumerate(names)}
+    for name, split_rows in splits.items():
+        if not split_rows:
+            raise ValueError(f"{key}: {name} split contains no valid records")
+    return splits
+
+
+def build_dataset(data_path: Path, work: Path, cfg):
+    """Split one turbine's clean timeline into disjoint Diffusion and LSTM stages."""
     with data_path.open("r", encoding="utf-8-sig", newline="") as f: raw = list(csv.DictReader(f))
     required_source = ["date", *SAMPLE_COLUMN_MAP]
     if (len(SAMPLE_COLUMN_MAP) != len(POWER) + len(WEATHER)
@@ -74,8 +83,6 @@ def build_dataset(data_path: Path, work: Path, cfg, scalers_override=None):
     regime_key = cfg.get("wind_regime_key", WIND_REGIME_KEY)
     if regime_key not in WEATHER:
         raise ValueError(f"wind_regime_key must name a weather feature: {regime_key}")
-    if not cfg.get("split_ratio") or any(float(x) <= 0 for x in cfg["split_ratio"]) or not np.isclose(sum(cfg["split_ratio"]), 1.0):
-        raise ValueError("split_ratio must contain positive shares summing to 1")
     if cfg.get("window_length", 0) < 1 or cfg.get("window_stride", 0) < 1:
         raise ValueError("window_length and window_stride must be positive")
     if cfg.get("forecast_input_steps", 0) < 1 or cfg.get("forecast_steps", 0) < 1:
@@ -97,30 +104,47 @@ def build_dataset(data_path: Path, work: Path, cfg, scalers_override=None):
             continue
         clean.append(row)
     n = len(clean)
-    a = int(n * cfg["split_ratio"][0])
-    b = int(n * sum(cfg["split_ratio"][:2]))
-    splits = {"train": clean[:a], "val": clean[a:b], "test": clean[b:]}
-    if not splits["train"]:
-        raise ValueError(f"{data_path.name}: training split contains no valid records")
+    midpoint = n // 2
+    diffusion_splits = _split_chronologically(clean[:midpoint], ("train", "val"),
+                                               cfg["diffusion_split_ratio"], "diffusion_split_ratio")
+    forecast_splits = _split_chronologically(clean[midpoint:], ("train", "val", "test"),
+                                              cfg["forecast_split_ratio"], "forecast_split_ratio")
+    # Fit shared normalization before either validation split or the forecast half.
+    scalers = _fit_scalers(diffusion_splits["train"], cfg)
+    audit = {"data_path": str(data_path), "rows_raw": len(raw), "rows_clean": n,
+             "duplicates_replaced": duplicates, "invalid_removed": invalid,
+             "low_wind_filter_enabled": bool(cfg.get("low_wind_filter_enabled", False)),
+             "low_wind_stopped_removed": stopped_removed,
+             "sample_interval_minutes": SAMPLE_INTERVAL_MINUTES,
+             "data_sha256": hashlib.sha256(data_path.read_bytes()).hexdigest(),
+             "scaler_fit_split": "diffusion/train"}
+    diffusion_arrays, diffusion_indexes, diffusion_audit = _prepare_splits(diffusion_splits, work / "diffusion", cfg, scalers, regime_key)
+    arrays, indexes, forecast_audit = _prepare_splits(forecast_splits, work / "forecast", cfg, scalers, regime_key)
+    audit.update(diffusion=diffusion_audit, forecast=forecast_audit)
+    return diffusion_arrays, diffusion_indexes, arrays, indexes, scalers, audit
+
+
+def _fit_scalers(rows, cfg):
     scalers = {"power": {}, "weather": {}}
-    if scalers_override is None:
-        power_min = cfg.get("power_scaler_min")
-        power_max = cfg.get("power_scaler_max")
-        if (power_min is None) != (power_max is None):
-            raise ValueError("power_scaler_min and power_scaler_max must be set together")
-        if power_min is not None and float(power_max) <= float(power_min):
-            raise ValueError("power_scaler_max must exceed power_scaler_min")
-        for key in POWER:
-            x = np.array([r[key] for r in splits["train"]])
-            scalers["power"][key] = ({"min": float(power_min), "max": float(power_max)} if power_min is not None
-                                      else {"min": float(x.min()), "max": float(x.max())})
-        for key in WEATHER:
-            x = np.array([r[key] for r in splits["train"]]); scalers["weather"][key] = {"mean": float(x.mean()), "std": float(x.std() or 1)}
-    else:
-        for group, keys in (("power", POWER), ("weather", WEATHER)):
-            if group not in scalers_override or any(key not in scalers_override[group] for key in keys):
-                raise ValueError(f"shared {group} scalers do not cover this dataset's configured features")
-            scalers[group] = {key: dict(scalers_override[group][key]) for key in keys}
+    power_min = cfg.get("power_scaler_min")
+    power_max = cfg.get("power_scaler_max")
+    if (power_min is None) != (power_max is None):
+        raise ValueError("power_scaler_min and power_scaler_max must be set together")
+    if power_min is not None and float(power_max) <= float(power_min):
+        raise ValueError("power_scaler_max must exceed power_scaler_min")
+    for key in POWER:
+        x = np.array([r[key] for r in rows])
+        scalers["power"][key] = ({"min": float(power_min), "max": float(power_max)} if power_min is not None
+                                  else {"min": float(x.min()), "max": float(x.max())})
+    for key in WEATHER:
+        x = np.array([r[key] for r in rows])
+        scalers["weather"][key] = {"mean": float(x.mean()), "std": float(x.std() or 1)}
+    return scalers
+
+
+def _prepare_splits(splits, work, cfg, scalers, regime_key):
+    """Normalize each split and create windows that never cross time gaps or split boundaries."""
+    (work / "windows").mkdir(parents=True, exist_ok=True)
     thresholds = tuple(cfg.get("wind_regime_thresholds_m_s", WIND_REGIME_THRESHOLDS))
     regimes = list(cfg.get("wind_regime_names", REGIME_NAMES))
     if len(regimes) != len(thresholds) + 1:
@@ -151,13 +175,10 @@ def build_dataset(data_path: Path, work: Path, cfg, scalers_override=None):
         for j, regime in enumerate(regimes): _csv(work / "data" / "clustered" / f"{split}_{regime}.csv", [x for x in base if x["wind_regime"] == j], [TIME, *POWER, *WEATHER, "wind_regime", "wind_regime_name", "segment_id"])
         np.savez_compressed(work / "windows" / f"{split}.npz", power=p, weather=w, cluster=labels, segment=segment, starts=indexes[split], window_end=meta[split]["window_end"], timestamps=meta[split]["timestamps"])
     (work / "data").mkdir(parents=True, exist_ok=True); (work / "data" / "scalers.json").write_text(json.dumps(scalers, indent=2), encoding="utf-8")
-    audit = {"rows_raw": len(raw), "rows_clean": n,
-             "duplicates_replaced": duplicates, "invalid_removed": invalid,
-             "low_wind_filter_enabled": bool(cfg.get("low_wind_filter_enabled", False)),
-             "low_wind_stopped_removed": stopped_removed,
-             "sample_interval_minutes": SAMPLE_INTERVAL_MINUTES,
-             "split_rows": {k: len(v) for k, v in splits.items()},
+    audit = {"split_rows": {k: len(v) for k, v in splits.items()},
              "window_counts": {k: len(v) for k, v in indexes.items()},
              "segment_counts": {k: int(np.unique(v["segment"]).size) for k, v in out_arrays.items()},
-             "data_sha256": hashlib.sha256(data_path.read_bytes()).hexdigest()}
-    (work / "data" / "audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8"); return out_arrays, indexes, scalers, audit
+             "time_ranges": {k: {"start": v[0]["_dt"].isoformat(), "end": v[-1]["_dt"].isoformat()}
+                             for k, v in splits.items()}}
+    (work / "data" / "audit.json").write_text(json.dumps(audit, indent=2), encoding="utf-8")
+    return out_arrays, indexes, audit

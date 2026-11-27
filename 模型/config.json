@@ -1,6 +1,5 @@
 {
-  "diffusion_data_path": "../data/data10_99MW.csv",
-  "forecast_data_path": "../data/nx18_100MW.csv",
+  "data_path": "../data/nx18_100MW.csv",
   "work_dir": "work",
   "results_dir": "result",
   "power_scaler_min": 0.0,
@@ -14,17 +13,19 @@
   "max_diffusion_window_length": 228,
   "diffusion_imputation_batch_size": 32,
   "diffusion_scenario_probabilities": {"point": 0.10, "continuous": 0.90},
-  "split_ratio": [0.70, 0.15, 0.15],
+  "diffusion_split_ratio": [0.85, 0.15],
+  "forecast_split_ratio": [0.70, 0.15, 0.15],
   "wind_regime_names": ["below_cut_in", "below_rated", "rated_to_high", "above_high_wind"],
   "scenarios": [
     {
       "name": "point_missing",
       "type": "point",
-      "missing_rates": [0.005, 0.01]
+      "missing_rates": [0.02, 0.02]
     },
     {
       "name": "continuous_missing",
       "type": "continuous",
+      "missing_rate": 0.10,
       "short_lengths": [6, 24],
       "medium_lengths": [25, 96],
       "long_lengths": [97, 192],
@@ -43,12 +44,14 @@
   "diffusion_heads": 8,
   "diffusion_train_steps": 300,
   "validation_ddim_steps": 30,
+  "diffusion_validation_recheck_top_k": 0,
   "ddim_steps": 150,
   "ddim_samples": 8,
   "num_workers": 0,
   "lstm_hidden_dim": 512,
   "lstm_layers": 2,
   "lstm_dropout": 0.1,
+  "lstm_fixed_epochs": null,
   "forecast_input_steps": 12,
   "forecast_steps": 12,
   "low_wind_filter_enabled": false
